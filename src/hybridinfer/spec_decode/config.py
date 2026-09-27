@@ -8,7 +8,7 @@ class SpeculativeConfig:
     max_draft_tokens: int = 4
     ngram_min: int = 2
     ngram_max: int = 8
-    verification_mode: str = "sequential"
+    verification_mode: str = "packed"
 
     def __post_init__(self):
         if self.method != "ngram":
@@ -17,5 +17,5 @@ class SpeculativeConfig:
             raise ValueError("max_draft_tokens must be positive")
         if not 1 <= self.ngram_min <= self.ngram_max:
             raise ValueError("invalid ngram range")
-        if self.verification_mode not in ("sequential", "packed_guarded"):
-            raise ValueError("verification_mode must be sequential or packed_guarded")
+        if self.verification_mode not in ("packed", "sequential", "packed_guarded"):
+            raise ValueError("verification_mode must be packed, sequential or packed_guarded")

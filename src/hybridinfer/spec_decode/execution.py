@@ -1,4 +1,4 @@
-"""Synchronous single-request reference path; deliberately makes no speed claim."""
+"""Single-request packed verification with optional reference diagnostics."""
 from time import perf_counter
 
 import torch
@@ -6,9 +6,11 @@ import torch
 from hybridinfer.utils.context import BatchDescriptor, set_context, reset_context
 from .state import GDNTransaction
 from .verifier import accept_greedy
+from .interfaces import VerificationPlan
 
 
-def packed_forward(runner, seq, plan, state_slot):
+@torch.inference_mode()
+def packed_forward(runner, seq, plan, state_slot, *, project=True):
     """One causal K+1-row forward, with every prediction row projected."""
     slot = runner.input_batch.slots_for([seq])[0]
     device = runner.request_state.tokens.tensor.device
@@ -29,15 +31,15 @@ def packed_forward(runner, seq, plan, state_slot):
                 batch_descriptor=BatchDescriptor(mode='spec_decode', num_tokens=count, num_reqs=1,
                                                  uniform_token_count=count, max_query_len=count))
     hidden = runner.model(torch.tensor(plan.input_tokens, dtype=torch.int64, device=device), positions)
-    return runner.model.compute_logits(hidden)
+    return runner.model.compute_logits(hidden) if project else None
 
 
 @torch.inference_mode()
-def verify_sequential(runner, seq, plan):
+def verify_speculative(runner, seq, plan):
     if runner._pending is not None or runner.world_size != 1:
         raise RuntimeError('verification requires an idle single-GPU runner')
     if seq.temperature != 0:
-        raise ValueError('reference verification requires temperature=0')
+        raise ValueError('speculative verification requires temperature=0')
     if (plan.request_id != seq.seq_id or plan.computed_length != seq.num_cached_tokens
             or seq.num_tokens != plan.computed_length + 1 or plan.anchor != seq.last_token):
         raise ValueError('verification plan disagrees with committed sequence')
@@ -75,18 +77,23 @@ def verify_sequential(runner, seq, plan):
         return runner.model.compute_logits(hidden) if project else None
 
     def clock():
-        # This is a correctness reference. Synchronize so phase costs include
-        # GPU work rather than reporting enqueue time as execution time.
         if device.type == 'cuda':
-            torch.cuda.synchronize(device)
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            return event
         return perf_counter()
+
+    def elapsed(start, end):
+        return start.elapsed_time(end) / 1000 if device.type == 'cuda' else end-start
 
     try:
         start = clock()
         with GDNTransaction(runner.gdn_layers, slot, private_slot) as txn:
             copied = clock()
             config = getattr(runner.config, 'speculative', None)
-            guarded = config is not None and config.verification_mode == 'packed_guarded'
+            mode = config.verification_mode if config is not None else 'sequential'
+            guarded = mode == 'packed_guarded'
+            used_packed = mode == 'packed'
             packed_predictions = None
             packed_state = []
             packed_kv = None
@@ -99,22 +106,25 @@ def verify_sequential(runner, seq, plan):
                            for p in range(plan.computed_length, plan.trial_end)]
                 flat = cache.reshape(*cache.shape[:2], -1, *cache.shape[-2:])
                 return flat.index_select(2, torch.tensor(mapping, dtype=torch.int64, device=device))
-            if guarded:
+            if mode in ('packed', 'packed_guarded'):
                 try:
                     packed_predictions = packed_forward(runner, seq, plan, private_slot).argmax(-1).tolist()
-                    packed_state = [pool[private_slot].clone() for pool, _ in txn.original]
-                    packed_kv = trial_kv()
+                    if guarded:
+                        packed_state = [pool[private_slot].clone() for pool, _ in txn.original]
+                        packed_kv = trial_kv()
                 except torch.cuda.OutOfMemoryError:
                     packed_resource_failure = True
+                    used_packed = False
                     packed_predictions, packed_state, packed_kv = None, [], None
-                # Validate against exactly the ordinary decode recurrence.
-                # This guard deliberately pays for both paths; it is the
-                # conservative fallback required before numerical certification.
-                for pool, original in txn.original:
-                    pool[private_slot].copy_(original)
+                # Strict debug mode and OOM fallback restart the private
+                # state before running the ordinary decode reference.
+                if guarded or packed_resource_failure:
+                    for pool, original in txn.original:
+                        pool[private_slot].copy_(original)
             packed_end = clock()
-            predictions = [int(forward(token, i, private_slot).argmax(-1).item())
-                           for i, token in enumerate(plan.input_tokens)]
+            predictions = packed_predictions if used_packed else [
+                int(forward(token, i, private_slot).argmax(-1).item())
+                for i, token in enumerate(plan.input_tokens)]
             verified = clock()
             if guarded:
                 token_mismatch = not packed_resource_failure and packed_predictions != predictions
@@ -128,8 +138,6 @@ def verify_sequential(runner, seq, plan):
                     ('packed_kv_mismatches', int(kv_mismatch)),
                     ('packed_resource_fallbacks', int(packed_resource_failure)),
                     ('packed_fallbacks', int(packed_resource_failure or token_mismatch or state_mismatch or kv_mismatch)),
-                    ('packed_seconds', packed_end-copied),
-                    ('reference_seconds', verified-packed_end),
                 ):
                     stats[key] = stats.get(key, 0) + value
                 if not (packed_resource_failure or token_mismatch or state_mismatch or kv_mismatch):
@@ -140,8 +148,15 @@ def verify_sequential(runner, seq, plan):
                                    eos=runner.config.eos, ignore_eos=seq.ignore_eos)
             count = result.committed_computed_length - plan.computed_length
             def replay():
-                for i, token in enumerate(plan.input_tokens[:count]):
-                    forward(token, i, slot, project=False)
+                if used_packed:
+                    # Replay only the committed input prefix using the same
+                    # causal path. The correction/EOS output remains uncomputed.
+                    replay_plan = VerificationPlan(plan.request_id, plan.computed_length,
+                                                   plan.anchor, plan.candidates[:count-1])
+                    packed_forward(runner, seq, replay_plan, slot, project=False)
+                else:
+                    for i, token in enumerate(plan.input_tokens[:count]):
+                        forward(token, i, slot, project=False)
             txn.commit(all_inputs_committed=count == len(plan.input_tokens), replay=replay)
             committed = clock()
             # Candidates were never placed in the resident token buffer.
@@ -151,16 +166,29 @@ def verify_sequential(runner, seq, plan):
             state.computed.tensor[slot] = result.committed_computed_length
             runner.sampled_token_ids_gpu[slot] = result.token_ids[-1]
             done = clock()
+            if device.type == 'cuda':
+                # One completion fence protects slot/page release after replay.
+                done.synchronize()
         stats['rounds'] += 1
         stats['draft_tokens'] += len(plan.candidates)
         stats['accepted_tokens'] += result.accepted_draft_tokens
         stats['output_tokens'] += result.output_length
         stats['trial_tokens'] += len(plan.input_tokens)
         stats['replay_tokens'] += count if count < len(plan.input_tokens) else 0
-        stats['copy_seconds'] += copied-start
-        stats['verify_seconds'] += verified-copied
-        stats['restore_seconds'] += committed-verified
-        stats['commit_seconds'] += done-committed
+        stats['copy_seconds'] += elapsed(start, copied)
+        stats['verify_seconds'] += elapsed(copied, verified)
+        stats['restore_seconds'] += elapsed(verified, committed)
+        stats['commit_seconds'] += elapsed(committed, done)
+        if mode in ('packed', 'packed_guarded'):
+            if not guarded:
+                for key, value in (('packed_rounds', 1), ('packed_trial_tokens', len(plan.input_tokens)),
+                                   ('packed_resource_fallbacks', int(packed_resource_failure)),
+                                   ('packed_fallbacks', int(packed_resource_failure))):
+                    stats[key] = stats.get(key, 0) + value
+            for key, value in (('packed_seconds', elapsed(copied, packed_end)),
+                               ('reference_trial_tokens', 0 if used_packed else len(plan.input_tokens)),
+                               ('reference_seconds', elapsed(packed_end, verified))):
+                stats[key] = stats.get(key, 0) + value
         return result
     except Exception:
         state.tokens.tensor[slot, plan.computed_length+1:plan.trial_end+1].copy_(original_tokens)

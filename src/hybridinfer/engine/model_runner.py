@@ -355,8 +355,8 @@ class ModelRunner:
         return self.cuda_graphs.run_decode(input_ids, positions)
 
     def verify_speculative(self, seq, plan):
-        from hybridinfer.spec_decode.execution import verify_sequential
-        return verify_sequential(self, seq, plan)
+        from hybridinfer.spec_decode.execution import verify_speculative
+        return verify_speculative(self, seq, plan)
 
     def execute_model(self, seqs: list[Sequence], is_prefill: bool) -> None:
         """MRV2 step: prepare inputs, enqueue the forward, return None.

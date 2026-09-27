@@ -6,7 +6,7 @@ from hybridinfer.engine.sequence import Sequence
 from hybridinfer.engine.request_state import InputBatch
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.spec_decode.interfaces import VerificationPlan
-from hybridinfer.spec_decode.execution import verify_sequential
+from hybridinfer.spec_decode.execution import verify_speculative
 from hybridinfer.spec_decode.config import SpeculativeConfig
 from hybridinfer.scheduler import Scheduler
 from hybridinfer.utils.context import get_context
@@ -23,9 +23,11 @@ def make_runner(seq, predictions, fail_replay=False, packed_state_drift=False, p
                             block_tables=SimpleNamespace(tensor=torch.tensor([[3, 4, 5], seq.block_table])),
                             update=lambda *args: None)
     kv = {}
+    calls = []
     class Model:
         def __call__(self, ids, positions):
             context = get_context()
+            calls.append(('packed' if context.is_prefill else 'decode', len(ids)))
             slot = int(context.state_indices[0])
             for token, position in zip(ids.tolist(), positions.tolist()):
                 for pool in (layer.conv_states, layer.recurrent_states):
@@ -47,7 +49,7 @@ def make_runner(seq, predictions, fail_replay=False, packed_state_drift=False, p
             return logits
     return SimpleNamespace(_pending=None, world_size=1, input_batch=batch, request_state=state,
                            config=SimpleNamespace(max_num_seqs=2, max_model_len=24, eos=-1),
-                           gdn_layers=[layer], block_size=4, model=Model(), kv=kv,
+                           gdn_layers=[layer], block_size=4, model=Model(), kv=kv, calls=calls,
                            sampled_token_ids_gpu=torch.zeros(2, dtype=torch.int64),
                            spec_metrics=dict(rounds=0, draft_tokens=0, accepted_tokens=0,
                                              output_tokens=0, trial_tokens=0, replay_tokens=0,
@@ -66,7 +68,7 @@ class ExecutionTests(unittest.TestCase):
                     predictions[accepted] = 99
                 runner = make_runner(seq, predictions)
                 before = seq.token_ids.copy()
-                r = verify_sequential(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
+                r = verify_speculative(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
                 count = min(accepted+1, remaining)
                 self.assertEqual(r.output_length, count)
                 self.assertEqual(int(runner.request_state.computed.tensor[1]), 3+count)
@@ -86,7 +88,7 @@ class ExecutionTests(unittest.TestCase):
         seq.block_table = [0, 1, 2]
         runner = make_runner(seq, [99, 6, 7, 8], fail_replay=True)
         with self.assertRaises(RuntimeError):
-            verify_sequential(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
+            verify_speculative(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
         self.assertTrue(torch.equal(runner.gdn_layers[0].recurrent_states[1], torch.ones(2)))
         self.assertEqual(int(runner.request_state.computed.tensor[1]), 3)
         self.assertEqual(seq.token_ids, [1, 2, 3, 4])
@@ -194,7 +196,7 @@ class PackedGuardTests(unittest.TestCase):
             runner = make_runner(seq, [5, 6, 7, 8], packed_state_drift=state_drift,
                                  packed_token_drift=token_drift)
             runner.config.speculative = SpeculativeConfig(enabled=True, verification_mode='packed_guarded')
-            result = verify_sequential(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
+            result = verify_speculative(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
             self.assertEqual(result.token_ids, (5, 6, 7, 8))
             self.assertEqual(runner.spec_metrics['packed_rounds'], 1)
             self.assertEqual(runner.spec_metrics['packed_trial_tokens'], 4)
@@ -215,9 +217,73 @@ class PackedGuardTests(unittest.TestCase):
             runner.gdn_layers[0].recurrent_states[2].add_(1000)
             raise torch.cuda.OutOfMemoryError('test allocation failure')
         with patch('hybridinfer.spec_decode.execution.packed_forward', side_effect=oom):
-            result = verify_sequential(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
+            result = verify_speculative(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
         self.assertEqual(result.token_ids, (5, 6, 7, 8))
         self.assertEqual(runner.spec_metrics['packed_resource_fallbacks'], 1)
         self.assertEqual(runner.spec_metrics['packed_fallbacks'], 1)
         self.assertEqual(runner.spec_metrics['packed_token_mismatches'], 0)
         self.assertTrue(torch.equal(runner.gdn_layers[0].recurrent_states[1], torch.full((2,), 23.)))
+
+
+class NativePackedTests(unittest.TestCase):
+    def ready(self, predictions, **kwargs):
+        seq = Sequence([1, 2, 3, 4], SamplingParams(temperature=0, max_tokens=10))
+        seq.num_cached_tokens = 3
+        seq.block_table = [0, 1, 2]
+        runner = make_runner(seq, predictions, **kwargs)
+        runner.config.speculative = SpeculativeConfig(enabled=True)
+        return seq, runner, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7))
+
+    def test_default_packed_accepts_native_predictions_and_state_without_reference(self):
+        from unittest.mock import patch
+        seq, runner, plan = self.ready([5, 6, 7, 8], packed_state_drift=True)
+        self.assertEqual(runner.config.speculative.verification_mode, 'packed')
+        with patch('torch.equal', side_effect=AssertionError('runtime state comparison')):
+            result = verify_speculative(runner, seq, plan)
+        self.assertEqual(result.token_ids, (5, 6, 7, 8))
+        self.assertEqual(runner.calls, [('packed', 4)])
+        self.assertAlmostEqual(float(runner.gdn_layers[0].recurrent_states[1, 0]), 23.01, places=4)
+        self.assertEqual(runner.spec_metrics['packed_fallbacks'], 0)
+        self.assertEqual(runner.spec_metrics['replay_tokens'], 0)
+        self.assertEqual(runner.spec_metrics['reference_trial_tokens'], 0)
+
+    def test_native_predictions_not_replaced_by_sequential_argmax(self):
+        seq, runner, plan = self.ready([5, 6, 7, 8], packed_token_drift=True)
+        result = verify_speculative(runner, seq, plan)
+        self.assertEqual(result.token_ids, (6,))
+        self.assertEqual(result.accepted_draft_tokens, 0)
+        self.assertEqual(runner.calls, [('packed', 4), ('packed', 1)])
+        self.assertEqual(int(runner.request_state.computed.tensor[1]), 4)
+
+    def test_each_rejection_and_eos_replays_only_committed_inputs(self):
+        for accepted in range(3):
+            predictions = [5, 6, 7, 8]
+            predictions[accepted] = 99
+            seq, runner, plan = self.ready(predictions)
+            result = verify_speculative(runner, seq, plan)
+            count = accepted+1
+            self.assertEqual(result.token_ids, (5, 6, 7)[:accepted]+(99,))
+            self.assertEqual(runner.calls, [('packed', 4), ('packed', count)])
+            self.assertEqual([runner.kv[i] for i in range(3, 3+count)], [4, 5, 6][:count])
+            self.assertEqual(float(runner.gdn_layers[0].recurrent_states[1, 0]), 1+sum([4, 5, 6][:count]))
+        seq, runner, plan = self.ready([5, 6, 7, 8])
+        runner.config.eos = 6
+        result = verify_speculative(runner, seq, plan)
+        self.assertEqual((result.token_ids, result.finish_reason), ((5, 6), 'eos'))
+        self.assertEqual(runner.calls, [('packed', 4), ('packed', 2)])
+        self.assertEqual(int(runner.request_state.computed.tensor[1]), 5)
+
+    def test_native_oom_fallback_and_replay_exception_cleanup(self):
+        from unittest.mock import patch
+        seq, runner, plan = self.ready([5, 6, 7, 8])
+        with patch('hybridinfer.spec_decode.execution.packed_forward', side_effect=torch.cuda.OutOfMemoryError()):
+            result = verify_speculative(runner, seq, plan)
+        self.assertEqual(result.token_ids, (5, 6, 7, 8))
+        self.assertEqual(runner.calls, [('decode', 1)]*4)
+        self.assertEqual(runner.spec_metrics['packed_resource_fallbacks'], 1)
+        seq, runner, plan = self.ready([99, 6, 7, 8], fail_replay=True)
+        with self.assertRaises(RuntimeError):
+            verify_speculative(runner, seq, plan)
+        self.assertTrue(torch.equal(runner.gdn_layers[0].recurrent_states[1], torch.ones(2)))
+        self.assertEqual(int(runner.request_state.computed.tensor[1]), 3)
+        self.assertEqual(runner.request_state.tokens.tensor[1, 4:].tolist(), [-1]*21)

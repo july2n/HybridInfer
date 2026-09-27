@@ -1,4 +1,4 @@
-"""Exact token and committed-state validation for the sequential P1 reference.
+"""Token, endpoint and state-recovery validation for speculative decoding.
 
 Run with PYTHONPATH=src python benchmarks/validate_spec_decode.py --model models/Qwen3.5-0.8B
 The same eager engine is reused at idle boundaries, keeping weights/kernels fixed.
@@ -16,6 +16,8 @@ from hybridinfer.engine.llm_engine import LLMEngine
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.spec_decode import SpeculativeConfig
 from hybridinfer.spec_decode.ngram import NgramProposer
+from hybridinfer.spec_decode.interfaces import VerificationPlan
+from hybridinfer.spec_decode.execution import packed_forward
 from hybridinfer.utils.context import get_context
 
 
@@ -43,11 +45,40 @@ def equal_state(reference, trial):
     return failures
 
 
+def state_drift(reference, trial):
+    diagnostics = {}
+    for key in ('kv', 'conv', 'recurrent'):
+        pairs = [(reference[key], trial[key])] if key == 'kv' else zip(reference[key], trial[key])
+        max_abs, square_sum, count, finite = 0., 0., 0, True
+        for before, after in pairs:
+            finite = finite and bool(torch.isfinite(after).all())
+            delta = after.float()-before.float()
+            max_abs = max(max_abs, float(delta.abs().max()))
+            square_sum += float(delta.square().sum())
+            count += delta.numel()
+        diagnostics[key] = dict(max_abs=max_abs, rmse=(square_sum/max(1, count))**0.5, finite=finite)
+    return diagnostics
+
+
+def same_block_reference(runner, seq, plan, result, before):
+    private_slot = runner.config.max_num_seqs
+    for layer, conv, recurrent in zip(runner.gdn_layers, before['conv'], before['recurrent']):
+        layer.conv_states[private_slot].copy_(conv)
+        layer.recurrent_states[private_slot].copy_(recurrent)
+    count = result.committed_computed_length-plan.computed_length
+    replay = VerificationPlan(plan.request_id, plan.computed_length, plan.anchor, plan.candidates[:count-1])
+    packed_forward(runner, seq, replay, private_slot, project=False)
+    ref = snapshot(runner, seq)
+    ref['conv'] = [layer.conv_states[private_slot].cpu().clone() for layer in runner.gdn_layers]
+    ref['recurrent'] = [layer.recurrent_states[private_slot].cpu().clone() for layer in runner.gdn_layers]
+    return ref
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='models/Qwen3.5-0.8B')
     parser.add_argument('--json-out', default='logs/validate/spec_sequential.json')
-    parser.add_argument('--verification-mode', choices=('sequential', 'packed_guarded'), default='sequential')
+    parser.add_argument('--verification-mode', choices=('packed', 'sequential', 'packed_guarded'), default='packed')
     args = parser.parse_args()
     engine = LLMEngine(args.model, max_num_seqs=2, max_model_len=1024,
                        max_num_batched_tokens=1024, gpu_memory_utilization=0.6,
@@ -119,12 +150,23 @@ def main():
                     else:
                         NgramProposer._propose_one = original_propose
                     def capture_verify(seq, plan):
+                        before_state = snapshot(runner, seq) if args.verification_mode == 'packed' else None
                         result = original_verify(seq, plan)
                         data = snapshot(runner, seq)
-                        mismatch = equal_state(reference[data['computed']], data)
+                        base = reference[data['computed']]
+                        drift = state_drift(base, data)
+                        if args.verification_mode == 'packed':
+                            ref = same_block_reference(runner, seq, plan, result, before_state)
+                            mismatch = equal_state(ref, data)
+                            if not torch.equal(base['tokens'], data['tokens']):
+                                mismatch.append('baseline_tokens')
+                        else:
+                            mismatch = equal_state(base, data)
+                        if not all(value['finite'] for value in drift.values()):
+                            mismatch.append('nonfinite_state')
                         errors.extend(mismatch)
                         checks.append(dict(computed=data['computed'], accepted=result.accepted_draft_tokens,
-                                           output=result.output_length, mismatches=mismatch))
+                                           output=result.output_length, mismatches=mismatch, baseline_state_drift=drift))
                         return result
                     runner.verify_speculative = capture_verify
                     before = dict(runner.spec_metrics)
@@ -147,6 +189,8 @@ def main():
         runner.verify_speculative = original_verify
         NgramProposer._propose_one = original_propose
         runner.model.compute_logits = original_logits
+        from hybridinfer.utils.context import reset_context
+        reset_context()
         engine.exit()
         path = Path(args.json_out)
         path.parent.mkdir(parents=True, exist_ok=True)
