@@ -17,5 +17,5 @@ class SpeculativeConfig:
             raise ValueError("max_draft_tokens must be positive")
         if not 1 <= self.ngram_min <= self.ngram_max:
             raise ValueError("invalid ngram range")
-        if self.verification_mode != "sequential":
-            raise ValueError("Only sequential reference verification is implemented")
+        if self.verification_mode not in ("sequential", "packed_guarded"):
+            raise ValueError("verification_mode must be sequential or packed_guarded")

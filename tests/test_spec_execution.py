@@ -12,7 +12,7 @@ from hybridinfer.scheduler import Scheduler
 from hybridinfer.utils.context import get_context
 
 
-def make_runner(seq, predictions, fail_replay=False):
+def make_runner(seq, predictions, fail_replay=False, packed_state_drift=False, packed_token_drift=False):
     layer = SimpleNamespace(conv_states=torch.ones(3, 2), recurrent_states=torch.ones(3, 2))
     batch = InputBatch(2)
     batch.update([Sequence([9]), seq])
@@ -27,19 +27,23 @@ def make_runner(seq, predictions, fail_replay=False):
         def __call__(self, ids, positions):
             context = get_context()
             slot = int(context.state_indices[0])
-            position = int(positions[0])
-            token = int(ids[0])
-            for pool in (layer.conv_states, layer.recurrent_states):
-                pool[slot].add_(token)
-            if fail_replay and slot == 1:
-                raise RuntimeError('replay failed')
-            kv[position] = token
-            return torch.tensor([[float(position)]])
+            for token, position in zip(ids.tolist(), positions.tolist()):
+                for pool in (layer.conv_states, layer.recurrent_states):
+                    pool[slot].add_(token)
+                if fail_replay and slot == 1:
+                    raise RuntimeError('replay failed')
+                kv[position] = token
+            if context.is_prefill and packed_state_drift:
+                layer.recurrent_states[slot].add_(0.01)
+            return positions[:, None].float()
 
         def compute_logits(self, hidden):
-            row = int(hidden[0, 0]) - seq.num_cached_tokens
-            logits = torch.full((1, 128), -100.)
-            logits[0, predictions[row]] = 100.
+            logits = torch.full((len(hidden), 128), -100.)
+            for i, position in enumerate(hidden[:, 0].tolist()):
+                target = predictions[int(position)-seq.num_cached_tokens]
+                if get_context().is_prefill and packed_token_drift:
+                    target = (target+1) % 128
+                logits[i, target] = 100.
             return logits
     return SimpleNamespace(_pending=None, world_size=1, input_batch=batch, request_state=state,
                            config=SimpleNamespace(max_num_seqs=2, max_model_len=24, eos=-1),
@@ -179,3 +183,41 @@ class RoutingTests(unittest.TestCase):
             self.assertEqual(actual[:, 0].tolist(), [1, 2, 3])
         finally:
             reset_context()
+
+
+class PackedGuardTests(unittest.TestCase):
+    def test_packed_rows_state_and_conservative_fallback(self):
+        for state_drift, token_drift in ((False, False), (True, False), (False, True)):
+            seq = Sequence([1, 2, 3, 4], SamplingParams(temperature=0, max_tokens=10))
+            seq.num_cached_tokens = 3
+            seq.block_table = [0, 1, 2]
+            runner = make_runner(seq, [5, 6, 7, 8], packed_state_drift=state_drift,
+                                 packed_token_drift=token_drift)
+            runner.config.speculative = SpeculativeConfig(enabled=True, verification_mode='packed_guarded')
+            result = verify_sequential(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
+            self.assertEqual(result.token_ids, (5, 6, 7, 8))
+            self.assertEqual(runner.spec_metrics['packed_rounds'], 1)
+            self.assertEqual(runner.spec_metrics['packed_trial_tokens'], 4)
+            self.assertEqual(runner.spec_metrics['packed_fallbacks'], int(state_drift or token_drift))
+            self.assertEqual(runner.spec_metrics['packed_state_mismatches'], int(state_drift))
+            self.assertEqual(runner.spec_metrics['packed_token_mismatches'], int(token_drift))
+            self.assertTrue(torch.equal(runner.gdn_layers[0].recurrent_states[1], torch.full((2,), 23.)))
+            self.assertEqual([runner.kv[i] for i in range(3, 7)], [4, 5, 6, 7])
+
+    def test_packed_oom_falls_back_without_committing_trial_state(self):
+        from unittest.mock import patch
+        seq = Sequence([1, 2, 3, 4], SamplingParams(temperature=0, max_tokens=10))
+        seq.num_cached_tokens = 3
+        seq.block_table = [0, 1, 2]
+        runner = make_runner(seq, [5, 6, 7, 8])
+        runner.config.speculative = SpeculativeConfig(enabled=True, verification_mode='packed_guarded')
+        def oom(*args):
+            runner.gdn_layers[0].recurrent_states[2].add_(1000)
+            raise torch.cuda.OutOfMemoryError('test allocation failure')
+        with patch('hybridinfer.spec_decode.execution.packed_forward', side_effect=oom):
+            result = verify_sequential(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
+        self.assertEqual(result.token_ids, (5, 6, 7, 8))
+        self.assertEqual(runner.spec_metrics['packed_resource_fallbacks'], 1)
+        self.assertEqual(runner.spec_metrics['packed_fallbacks'], 1)
+        self.assertEqual(runner.spec_metrics['packed_token_mismatches'], 0)
+        self.assertTrue(torch.equal(runner.gdn_layers[0].recurrent_states[1], torch.full((2,), 23.)))

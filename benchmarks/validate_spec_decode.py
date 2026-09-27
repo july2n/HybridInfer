@@ -47,10 +47,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='models/Qwen3.5-0.8B')
     parser.add_argument('--json-out', default='logs/validate/spec_sequential.json')
+    parser.add_argument('--verification-mode', choices=('sequential', 'packed_guarded'), default='sequential')
     args = parser.parse_args()
     engine = LLMEngine(args.model, max_num_seqs=2, max_model_len=1024,
                        max_num_batched_tokens=1024, gpu_memory_utilization=0.6,
-                       enforce_eager=True, enable_prefix_cache=True, speculative=SpeculativeConfig(enabled=True))
+                       enforce_eager=True, enable_prefix_cache=True, speculative=SpeculativeConfig(enabled=True, verification_mode=args.verification_mode))
     records = []
     runner = engine.model_runner
     original_sample = runner.sample_tokens
@@ -72,10 +73,20 @@ def main():
                 def terminal_logits(hidden):
                     logits = original_logits(hidden)
                     context = get_context()
-                    if (termination == 'eos' and not context.is_prefill
-                            and int(context.context_lens[0].item()) == len(prompt)+2):
-                        logits.fill_(-100.)
-                        logits[:, 999] = 100.
+                    if termination == 'eos':
+                        if not context.is_prefill:
+                            endpoint = int(context.context_lens[0].item())
+                            eos_row = 0 if endpoint == len(prompt)+2 else None
+                        elif context.batch_descriptor.mode == 'spec_decode':
+                            start = int(context.cu_seqlens_k[-1].item()) - len(logits)
+                            eos_row = len(prompt)+1-start
+                            if not 0 <= eos_row < len(logits):
+                                eos_row = None
+                        else:
+                            eos_row = None
+                        if eos_row is not None:
+                            logits[eos_row].fill_(-100.)
+                            logits[eos_row, 999] = 100.
                     return logits
                 runner.model.compute_logits = terminal_logits
                 engine.scheduler.speculative = None
@@ -93,7 +104,7 @@ def main():
                 runner.sample_tokens = original_sample
                 for accepted in (*range(5), None):
                     checks, errors = [], []
-                    engine.scheduler.speculative = SpeculativeConfig(enabled=True, max_draft_tokens=4)
+                    engine.scheduler.speculative = SpeculativeConfig(enabled=True, max_draft_tokens=4, verification_mode=args.verification_mode)
                     if accepted is not None:
                         def controlled(self, context, accepted=accepted):
                             length = len(context.token_ids) - len(prompt)
@@ -121,7 +132,7 @@ def main():
                     start = perf_counter()
                     actual = engine.generate([prompt], params, use_tqdm=False)[0]['token_ids']
                     elapsed = perf_counter()-start
-                    metrics = {key: value-before[key] for key, value in runner.spec_metrics.items()}
+                    metrics = {key: value-before.get(key, 0) for key, value in runner.spec_metrics.items()}
                     record = dict(termination=termination, prefix_cache_hits=checkpoints.hits-prefix_hits_before, prefix_cache=prefix, forced_acceptance=accepted, token_match=actual == baseline,
                                   state_checks=checks, state_match=not errors, metrics=metrics,
                                   diagnostic_elapsed_seconds=elapsed)
@@ -140,7 +151,7 @@ def main():
         path = Path(args.json_out)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(dict(torch=torch.__version__, model=args.model,
-                                       path='sequential_eager_reference', cases=records), indent=2)+'\n')
+                                       path=args.verification_mode+'_eager_reference', cases=records), indent=2)+'\n')
 
 
 if __name__ == '__main__':

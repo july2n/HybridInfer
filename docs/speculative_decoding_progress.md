@@ -2,7 +2,7 @@
 
 ## 当前可用范围
 
-P0 基础契约和 P1 的 n-gram **逐词元验证参考闭环**已实现。默认关闭；开启方式：
+P0 基础契约和 P1 的 n-gram 贪心正确性闭环已实现，提供逐词元参考模式和带数值检查的多词元验证模式。默认关闭；开启方式：
 
 ```python
 from hybridinfer.engine.llm_engine import LLMEngine
@@ -46,8 +46,23 @@ PYTHONPATH=src:.runtime-deps /home/lang/anaconda3/envs/vllm_env/bin/python \
 
 JSON 和日志位于 `logs/validate/spec_sequential.{json,log}`。这些带 CPU 状态快照的耗时是诊断耗时，不能当作吞吐基准。`engine.model_runner.spec_metrics` 记录候选、接受、输出、试算与重放数量，以及同步测量的状态复制、验证、恢复和 GPU 提交耗时；`engine.scheduler.spec_fallbacks` 记录回退原因。
 
-## 尚未完成
+## 多词元验证与数值回退
 
-P1 的单次多词元主模型验证仍待实现。当前每轮试算 K+1 次前向，部分接受还需要重放，不能据此宣称加速。下一步接入 eager 多词元因果验证，同时对照普通逐词元路径与同分块主模型参考；若出现 BF16 差异导致词元不一致，应保守回退或修复内核，不放宽验收容差。
+可选配置 `verification_mode="packed_guarded"`：单次 eager 因果前向输入 K+1 个词元，投影所有预测行，随后使用相同入口状态运行逐词元参考检查。逐词元试算覆盖 native 试算 KV 尾部，只有精确一致时使用 native 预测；存在 argmax、GDN 或 KV 差异时使用参考结果和状态。显存不足也恢复私有状态后使用逐词元路径。两种路径都不发布候选历史。
+
+真实模型再运行 36 个场景（共 84 轮验证）：最终词元及已提交状态全部与普通解码精确一致；native argmax 未发生差异，但 **84/84 轮的 GDN 和 KV 均存在数值差异，全部回退**。记录位于 `logs/validate/spec_packed_guarded.{json,log}`。这些结果证明当前环境需要保守恢复策略，不能据此认证无检查的 native 批量路径。没有放宽容差。
+
+```bash
+PYTHONPATH=src:.runtime-deps /home/lang/anaconda3/envs/vllm_env/bin/python \
+  benchmarks/validate_spec_decode.py --model models/Qwen3.5-0.8B \
+  --verification-mode packed_guarded \
+  --json-out logs/validate/spec_packed_guarded.json
+```
+
+`spec_metrics` 额外记录 packed 验证次数/输入数、词元/GDN/KV 数值差异次数、显存不足回退次数，以及 packed 和 reference 的分别耗时。逐词元检查、额外状态副本及部分接受重放都有成本；两种模式均不宣称加速。默认保持 `sequential`。
+
+## 后续工作
+
+先分析批量 GEMM、GDN chunk scan 与单词元 recurrence 的 BF16 差异，明确可接受的数值契约或修复内核，再考虑移除逐轮参考检查。当前没有提供无检查的 native 模式。
 
 P2 的变长批处理、GPU 批量提交、异步多词元输出，以及 P3–P7 的性能优化、随机拒绝采样和真实模型草稿均尚未实现。MTP/EAGLE/DFlash 没有创建占位模型支持。

@@ -8,6 +8,30 @@ from .state import GDNTransaction
 from .verifier import accept_greedy
 
 
+def packed_forward(runner, seq, plan, state_slot):
+    """One causal K+1-row forward, with every prediction row projected."""
+    slot = runner.input_batch.slots_for([seq])[0]
+    device = runner.request_state.tokens.tensor.device
+    count = len(plan.input_tokens)
+    positions = torch.arange(plan.computed_length, plan.trial_end, dtype=torch.int64, device=device)
+    mapping = [seq.block_table[p // runner.block_size] * runner.block_size + p % runner.block_size
+               for p in range(plan.computed_length, plan.trial_end)]
+    set_context(True,
+                cu_seqlens_q=torch.tensor([0, count], dtype=torch.int32, device=device),
+                cu_seqlens_k=torch.tensor([0, plan.trial_end], dtype=torch.int32, device=device),
+                max_seqlen_q=count, max_seqlen_k=plan.trial_end,
+                slot_mapping=torch.tensor(mapping, dtype=torch.int32, device=device),
+                block_tables=runner.request_state.block_tables.tensor[slot:slot+1],
+                state_indices=torch.tensor([state_slot], dtype=torch.int64, device=device),
+                prefill_slices=[(0, count)],
+                prefill_chunk_indices=torch.tensor([(0, i) for i in range((count+63)//64)],
+                                                  dtype=torch.int32, device=device),
+                batch_descriptor=BatchDescriptor(mode='spec_decode', num_tokens=count, num_reqs=1,
+                                                 uniform_token_count=count, max_query_len=count))
+    hidden = runner.model(torch.tensor(plan.input_tokens, dtype=torch.int64, device=device), positions)
+    return runner.model.compute_logits(hidden)
+
+
 @torch.inference_mode()
 def verify_sequential(runner, seq, plan):
     if runner._pending is not None or runner.world_size != 1:
@@ -61,9 +85,55 @@ def verify_sequential(runner, seq, plan):
         start = clock()
         with GDNTransaction(runner.gdn_layers, slot, private_slot) as txn:
             copied = clock()
+            config = getattr(runner.config, 'speculative', None)
+            guarded = config is not None and config.verification_mode == 'packed_guarded'
+            packed_predictions = None
+            packed_state = []
+            packed_kv = None
+            packed_resource_failure = False
+            def trial_kv():
+                cache = getattr(runner, 'kv_cache', None)
+                if cache is None:
+                    return None
+                mapping = [seq.block_table[p // runner.block_size] * runner.block_size + p % runner.block_size
+                           for p in range(plan.computed_length, plan.trial_end)]
+                flat = cache.reshape(*cache.shape[:2], -1, *cache.shape[-2:])
+                return flat.index_select(2, torch.tensor(mapping, dtype=torch.int64, device=device))
+            if guarded:
+                try:
+                    packed_predictions = packed_forward(runner, seq, plan, private_slot).argmax(-1).tolist()
+                    packed_state = [pool[private_slot].clone() for pool, _ in txn.original]
+                    packed_kv = trial_kv()
+                except torch.cuda.OutOfMemoryError:
+                    packed_resource_failure = True
+                    packed_predictions, packed_state, packed_kv = None, [], None
+                # Validate against exactly the ordinary decode recurrence.
+                # This guard deliberately pays for both paths; it is the
+                # conservative fallback required before numerical certification.
+                for pool, original in txn.original:
+                    pool[private_slot].copy_(original)
+            packed_end = clock()
             predictions = [int(forward(token, i, private_slot).argmax(-1).item())
                            for i, token in enumerate(plan.input_tokens)]
             verified = clock()
+            if guarded:
+                token_mismatch = not packed_resource_failure and packed_predictions != predictions
+                state_mismatch = any(not torch.equal(saved, pool[private_slot])
+                                     for saved, (pool, _) in zip(packed_state, txn.original))
+                kv_mismatch = packed_kv is not None and not torch.equal(packed_kv, trial_kv())
+                for key, value in (
+                    ('packed_rounds', 1), ('packed_trial_tokens', len(plan.input_tokens)),
+                    ('packed_token_mismatches', int(token_mismatch)),
+                    ('packed_state_mismatches', int(state_mismatch)),
+                    ('packed_kv_mismatches', int(kv_mismatch)),
+                    ('packed_resource_fallbacks', int(packed_resource_failure)),
+                    ('packed_fallbacks', int(packed_resource_failure or token_mismatch or state_mismatch or kv_mismatch)),
+                    ('packed_seconds', packed_end-copied),
+                    ('reference_seconds', verified-packed_end),
+                ):
+                    stats[key] = stats.get(key, 0) + value
+                if not (packed_resource_failure or token_mismatch or state_mismatch or kv_mismatch):
+                    predictions = packed_predictions
             result = accept_greedy(plan, predictions,
                                    remaining_output_tokens=seq.max_tokens-seq.num_completion_tokens,
                                    max_model_len=runner.config.max_model_len,
