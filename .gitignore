@@ -1,0 +1,36 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+.runtime-deps/
+
+# Downloaded model files
+/models/
+*.safetensors
+*.pt
+*.pth
+
+# Local editor and agent settings
+.vscode/
+.claude/
+.agents/
+.codex/
+.env
+.env.*
+!.env.example
+
+# Benchmark traces and logs
+logs/
+todo.md
