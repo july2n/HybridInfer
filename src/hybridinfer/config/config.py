@@ -1,11 +1,13 @@
 import os
 from dataclasses import dataclass
 from transformers import AutoConfig
+from hybridinfer.spec_decode import SpeculativeConfig
 
 
 @dataclass(slots=True)
 class Config:
     model: str
+    speculative: SpeculativeConfig | None = None
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
@@ -23,6 +25,10 @@ class Config:
     max_state_slots: int = 0
 
     def __post_init__(self):
+        if self.speculative is not None and not isinstance(self.speculative, SpeculativeConfig):
+            raise TypeError("speculative must be a SpeculativeConfig")
+        if self.speculative and self.speculative.enabled and self.tensor_parallel_size != 1:
+            raise ValueError("Speculative decoding currently requires a single GPU")
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
