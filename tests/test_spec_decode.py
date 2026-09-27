@@ -60,3 +60,39 @@ class ContractTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NgramTests(unittest.TestCase):
+    def draft(self, tokens, remaining=20, limit=100, budget=20, **kwargs):
+        from hybridinfer.spec_decode.ngram import NgramProposer
+        context = DraftContext(7, tuple(tokens), len(tokens)-1, remaining, limit, budget)
+        return NgramProposer(SpeculativeConfig(**kwargs)).propose([context]).tokens_for(0)
+
+    def test_no_match_and_short_history(self):
+        self.assertEqual(self.draft([1]), ())
+        self.assertEqual(self.draft([1, 2, 3]), ())
+
+    def test_longest_then_nearest(self):
+        self.assertEqual(self.draft([1, 2, 3, 8, 2, 3, 9, 1, 2, 3]), (8, 2, 3, 9))
+        self.assertEqual(self.draft([1, 2, 8, 1, 2, 9, 1, 2]), (9, 1, 2))
+
+    def test_overlap_is_finite(self):
+        self.assertEqual(self.draft([1, 1, 1, 1], ngram_min=2, ngram_max=2), (1,))
+        self.assertEqual(self.draft([1, 2, 1, 2], ngram_max=2), (1, 2))
+
+    def test_budget_clipping(self):
+        history = [1, 2, 3, 4, 5, 1, 2]
+        self.assertEqual(self.draft(history, remaining=2), (3,))
+        self.assertEqual(self.draft(history, limit=8), (3,))
+        self.assertEqual(self.draft(history, budget=2), (3,))
+        self.assertEqual(self.draft(history, max_draft_tokens=2), (3, 4))
+        self.assertEqual(self.draft(history, remaining=1), ())
+
+    def test_variable_batch_and_no_history_mutation(self):
+        from hybridinfer.spec_decode.ngram import NgramProposer
+        contexts = [DraftContext(7, (1, 2, 1, 2), 3, 10, 20, 5),
+                    DraftContext(9, (8, 9), 1, 10, 20, 5)]
+        before = list(contexts)
+        result = NgramProposer(SpeculativeConfig(ngram_max=2)).propose(contexts)
+        self.assertEqual(result.offsets, (0, 2, 2))
+        self.assertEqual(contexts, before)
