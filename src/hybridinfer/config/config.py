@@ -7,7 +7,6 @@ from hybridinfer.spec_decode import SpeculativeConfig
 @dataclass(slots=True)
 class Config:
     model: str
-    speculative: SpeculativeConfig | None = None
     max_num_batched_tokens: int = 16384
     max_num_seqs: int = 512
     max_model_len: int = 4096
@@ -23,6 +22,7 @@ class Config:
     num_kvcache_blocks: int = -1
     is_hybrid: bool = False
     max_state_slots: int = 0
+    speculative: SpeculativeConfig | None = None
 
     def __post_init__(self):
         if self.speculative is not None and not isinstance(self.speculative, SpeculativeConfig):

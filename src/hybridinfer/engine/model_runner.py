@@ -91,6 +91,10 @@ class ModelRunner:
         # Only the execute/sample entrypoints are paired; completed GPU
         # submissions may remain in flight independently in the engine queue.
         self._pending: tuple | None = None
+        self.spec_metrics = dict(rounds=0, draft_tokens=0, accepted_tokens=0,
+                                 output_tokens=0, trial_tokens=0, replay_tokens=0,
+                                 copy_seconds=0., verify_seconds=0.,
+                                 restore_seconds=0., commit_seconds=0.)
         self.allocate_gdn_state_pool()
         self.allocate_prefix_snapshots()
         self.warmup_model()
@@ -242,6 +246,9 @@ class ModelRunner:
 
     def allocate_gdn_state_pool(self):
         num_slots = self.config.max_num_seqs
+        speculative = self.config.speculative
+        if speculative and speculative.enabled:
+            num_slots += 1  # Private synchronous trial slot, never a prefix snapshot.
         for layer in self.gdn_layers:
             layer.allocate_state_pool(num_slots)
 
@@ -333,6 +340,9 @@ class ModelRunner:
         else:
             mode = "prefill" if is_prefill else "decode"
 
+        if mode == "spec_decode":
+            return self.model.compute_logits(self.model(input_ids, positions))
+
         if self.enforce_eager or not self.cuda_graphs.decode_graphs:
             return self.compute_logits(self.model(input_ids, positions), is_prefill)
 
@@ -341,8 +351,12 @@ class ModelRunner:
         if mode == "prefill":
             return self.compute_logits(self.model(input_ids, positions), True)
 
-        # Decode / spec_decode: dispatch through the graph manager.
+        # Ordinary decode dispatches through the graph manager.
         return self.cuda_graphs.run_decode(input_ids, positions)
+
+    def verify_speculative(self, seq, plan):
+        from hybridinfer.spec_decode.execution import verify_sequential
+        return verify_sequential(self, seq, plan)
 
     def execute_model(self, seqs: list[Sequence], is_prefill: bool) -> None:
         """MRV2 step: prepare inputs, enqueue the forward, return None.

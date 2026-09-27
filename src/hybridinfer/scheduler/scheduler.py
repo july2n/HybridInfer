@@ -9,6 +9,8 @@ from hybridinfer.engine.prefix_checkpoint import PrefixCheckpointManager
 class Scheduler:
 
     def __init__(self, config: Config):
+        self.speculative = getattr(config, "speculative", None)
+        self.spec_fallbacks = {}
         self.max_num_seqs = config.max_num_seqs
         self.max_model_len = config.max_model_len
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -35,6 +37,59 @@ class Scheduler:
         if not 0 < seq.num_tokens <= self.max_model_len:
             raise ValueError("prompt must fit within max_model_len and contain tokens")
         self.waiting.append(seq)
+
+    def begin_speculative(self):
+        """P1 reference: one ready decode request, no overlapping work."""
+        config = self.speculative
+        if not config or not config.enabled:
+            return None
+        def fallback(reason):
+            self.spec_fallbacks[reason] = self.spec_fallbacks.get(reason, 0) + 1
+            return None
+        if self.waiting or self.in_flight or len(self.running) != 1:
+            return fallback("batch_or_prefill")
+        seq = self.running[0]
+        if seq.temperature != 0:
+            return fallback("temperature")
+        from hybridinfer.spec_decode.interfaces import DraftContext, VerificationPlan
+        from hybridinfer.spec_decode.ngram import NgramProposer
+        context = DraftContext(seq.seq_id, tuple(seq.token_ids), seq.num_cached_tokens,
+                               seq.max_tokens - seq.num_completion_tokens,
+                               self.max_model_len, self.max_num_batched_tokens)
+        proposal = NgramProposer(config).propose([context])
+        candidates = proposal.tokens_for(0)
+        if not candidates:
+            return fallback("no_draft_or_budget")
+        plan = VerificationPlan(seq.seq_id, seq.num_cached_tokens, seq.last_token, candidates)
+        if not self.block_manager.reserve_trial(seq, plan.trial_end):
+            return fallback("kv_capacity_or_shared_tail")
+        self.running.popleft()
+        self.in_flight.add(seq.seq_id)
+        return seq, plan
+
+    def abort_speculative(self, seq):
+        self.block_manager.trim_trial(seq, seq.num_cached_tokens)
+        self.in_flight.discard(seq.seq_id)
+        self.running.appendleft(seq)
+
+    def finish_speculative(self, seq, result):
+        if seq.seq_id not in self.in_flight:
+            raise RuntimeError("speculative request is not in flight")
+        seq.append_tokens(result.token_ids)
+        seq.num_scheduled_tokens = result.committed_computed_length - seq.num_cached_tokens
+        self.block_manager.trim_trial(seq, result.committed_computed_length)
+        if self.enable_prefix_cache:
+            self.block_manager.hash_blocks(seq)
+        seq.num_cached_tokens = result.committed_computed_length
+        seq.num_scheduled_tokens = 0
+        self.in_flight.remove(seq.seq_id)
+        if result.finished:
+            seq.status = SequenceStatus.FINISHED
+            self.resident.discard(seq.seq_id)
+            self.block_manager.deallocate(seq)
+        else:
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []

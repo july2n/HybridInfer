@@ -148,6 +148,22 @@ class LLMEngine:
         more decode; new prefill work is still allowed to dispatch so
         late arrivals keep making progress.
         """
+        # P1 synchronous reference runs only when every queued batch has drained.
+        if not self.batch_queue:
+            speculative = self.scheduler.begin_speculative()
+            if speculative is not None:
+                seq, plan = speculative
+                try:
+                    result = self.model_runner.call("verify_speculative", seq, plan)
+                except Exception:
+                    self.scheduler.abort_speculative(seq)
+                    raise
+                self.scheduler.finish_speculative(seq, result)
+                if result.finished:
+                    self.model_runner.call("remove_request", seq.seq_id)
+                    return [(seq.seq_id, seq.completion_token_ids)], -result.output_length
+                return [], -result.output_length
+
         # Phase 1: fill the queue (never blocks).
         while len(self.batch_queue) < self.max_concurrent_batches:
             decode_batches = [
