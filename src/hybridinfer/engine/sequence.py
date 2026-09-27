@@ -72,6 +72,13 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def append_tokens(self, token_ids):
+        tokens = list(token_ids)
+        if tokens:
+            self.token_ids.extend(tokens)
+            self.last_token = tokens[-1]
+            self.num_tokens += len(tokens)
+
     def __getstate__(self):
         # Preserve identity, lifecycle and sampling metadata on TP workers.
         return self.__dict__.copy()

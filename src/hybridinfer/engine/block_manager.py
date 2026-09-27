@@ -115,6 +115,35 @@ class BlockManager:
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
+    def reserve_trial(self, seq: Sequence, computed_end: int) -> bool:
+        """Reserve unpublished tail pages without changing committed history.
+
+        Shared writable tails conservatively fall back until copy-on-write is
+        implemented. Shared complete prefix pages are never trial write targets.
+        """
+        if computed_end < seq.num_cached_tokens:
+            raise ValueError("trial endpoint precedes committed state")
+        first = seq.num_cached_tokens // self.block_size
+        for block_id in seq.block_table[first:]:
+            if self.blocks[block_id].ref_count != 1:
+                return False
+        count = (computed_end + self.block_size - 1) // self.block_size
+        needed = max(0, count - len(seq.block_table))
+        if needed > len(self.free_block_ids):
+            return False
+        for _ in range(needed):
+            seq.block_table.append(self._allocate_block())
+        return True
+
+    def trim_trial(self, seq: Sequence, computed_end: int):
+        count = (computed_end + self.block_size - 1) // self.block_size
+        while len(seq.block_table) > count:
+            block_id = seq.block_table.pop()
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
         end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
