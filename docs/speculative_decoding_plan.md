@@ -1,5 +1,9 @@
 # 投机解码实施计划
 
+**2026-09-28 目标更新：最终适配 EAGLE-3、P-EAGLE、DFlash、DFlash2、DSpark、MTP；n-gram 仅作为公共链路测试后端。** 新的固定 vLLM 新旧 runner 对齐检查、六种方法的独立特征/缓存/分布契约及实施顺序见 [vLLM 对齐审计](vllm_speculative_alignment.md)。后续按“公共 target recurrent 验证与状态选择 → 设备草稿/特征接口与拒绝 sampler → 本地真实 MTP → EAGLE-3/P-EAGLE → DFlash/DFlash2/DSpark”推进；不继续以 n-gram 性能优化作为最终交付。
+
+**最新实施：** 公共 recurrent target、原 trial 端点选择、设备特征/草稿接口、共享随机拒绝及真实 MTP 已接入；完整严格生成门槛尚未通过。详见 [本次实施与验收](speculative_mtp_implementation.md)。以下保留原阶段计划作为验收背景。
+
 本文定义实施范围和验收门槛；实际交付与验证结果见[实施记录](speculative_decoding_progress.md)。目前 P0 与单请求 n-gram 贪心执行链路已实现，正常 packed 路径的扩展词元一致性验收仍未通过，P2 已接入首版变长批量执行、GPU 接受/提交与异步输出句柄，完整系统验收仍在补齐。第一阶段以 n-gram 草稿和贪心验证建立可验证的执行链路，最终支持 MTP、EAGLE/EAGLE3、DFlash 等草稿方法。默认关闭，关闭后保留现有执行行为。
 
 ## 1. 目标与范围
@@ -163,8 +167,8 @@ vLLM 的混合状态路径也需要按接受端点选择 recurrent state，不�
 | P3：性能优化 | 逐位置状态/分段恢复、自适应 K、按接受收益回退、分段图验证 | 分项测量证明收益来源；低命中负载不持续承担无效验证成本 |
 | P4：随机投机采样 | 草稿分布协议、拒绝采样、补偿分布、位置稳定随机计数 | 小词表统计验证主模型目标分布；拒绝后随机计数不受未提交候选污染 |
 | P5：MTP | 目标隐藏状态导出、模型专属预测头与权重加载、草稿缓存同步 | 使用兼容且权重完整的模型验证；不能以空接口宣称支持 |
-| P6：EAGLE/EAGLE3 | 对应训练草稿的特征层、投影、词表映射及缓存适配 | 先支持线性候选链，匹配 checkpoint 的特征契约；树验证另行设计 |
-| P7：DFlash | 条件隐藏状态、块级并行草稿、草稿掩码与位置布局 | 草稿模型可用且兼容；草稿内部非自回归掩码不泄漏到主模型因果验证 |
+| P6：EAGLE-3/P-EAGLE | 对应训练草稿的特征层、投影、词表映射及缓存适配；P-EAGLE 并行查询和预算 | 先支持线性候选链，匹配 checkpoint 的特征契约；并行模式须有对应训练权重；树验证另行设计 |
+| P7：DFlash/DFlash2/DSpark | 条件隐藏状态、context/query KV、块级草稿掩码与位置；DFlash2 selector；DSpark Markov/confidence | 每种草稿模型真实加载并分别验收；缓存实际条件 q；草稿掩码不泄漏到主模型因果验证 |
 
 P1 首先提供逐词元验证参考路径，再接入批量验证。参考路径不要求加速，是状态和预测行对齐的正确性基准。
 
@@ -186,13 +190,17 @@ n-gram 的确定候选可视为点质量 q，而不是“没有草稿概率”�
 
 草稿、接受判定和目标采样使用独立的随机计数域，基于请求与逻辑位置定义。随机结果要求分布正确；不承诺与非投机路径同 seed 的样本逐词元相同。贪心与随机验收分别报告。
 
-## 9. MTP、EAGLE 与 DFlash 的扩展边界
+## 9. MTP、EAGLE-3/P-EAGLE 与 DFlash/DFlash2/DSpark 的扩展边界
 
-MTP 需要匹配目标架构的预测头及训练权重。当前加载器跳过 MTP 参数，必须显式注册并验证加载完整性；本地 Qwen3.5-0.8B 是否具备可用预测头需检查 checkpoint，不能预设存在。
+MTP 需要匹配目标架构的预测头及训练权重。当前加载器跳过 MTP 参数，必须显式注册并验证加载完整性；2026-09-28 已检查本地 Qwen3.5-0.8B safetensors，确认具有 15 个真实 MTP 张量，约 39.01 MiB，但尚未接入本引擎执行。
 
 EAGLE 家族需要兼容目标模型的训练草稿，使用的目标特征层、归一化位置和词表映射可能不同。目标模型提供可选的层级特征导出接口，按实际需要分配；没有模型草稿时，不额外保存全部隐藏层。
 
+P-EAGLE 使用对应并行训练的 EAGLE-3 checkpoint。固定 vLLM 路由为 `eagle3` 加 `parallel_drafting=True`，须适配并行 mask/位置与额外查询 slots，不能通过改变普通 EAGLE-3 的循环方式宣称支持。
+
 DFlash 使用目标隐藏状态条件下的块级并行草稿模型，草稿网络的计算和注意力布局与自回归主模型不同。它可以输出统一候选链供验证，但其模型执行不能伪装成 n-gram 或普通自回归循环。
+
+DFlash2 在固定 vLLM 中通过 `dflash` 方法加 `DFlash2DraftModel` 架构选择，额外包含局部动态卷积与 predecessor-conditioned top-K selector。DSpark 有独立 `dspark` 路由，增加 Markov head、可选 confidence 与 checkpoint 专属 anchor 布局。两者的实际条件草稿分布、缓存和预算必须分别实现，不能按普通 DFlash 的 unary logits 校正概率。
 
 未来每种方法的“支持”均需包括真实模型加载、草稿执行、拒绝恢复、验收脚本和性能记录。准备好接口只是架构准备，不是完成模型支持。
 

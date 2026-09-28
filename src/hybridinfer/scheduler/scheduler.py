@@ -10,11 +10,13 @@ class Scheduler:
 
     def __init__(self, config: Config):
         self.speculative = getattr(config, "speculative", None)
+        self.draft_proposer = None
         self.spec_fallbacks = {}
         self._spec_trial_block_counts = {}
         self.max_num_seqs = config.max_num_seqs
         self.max_model_len = config.max_model_len
         self.max_num_batched_tokens = config.max_num_batched_tokens
+        self.max_speculative_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.enable_prefix_cache = config.enable_prefix_cache
@@ -56,12 +58,13 @@ class Scheduler:
         from hybridinfer.spec_decode.ngram import NgramProposer
         context = DraftContext(seq.seq_id, tuple(seq.token_ids), seq.num_cached_tokens,
                                seq.max_tokens - seq.num_completion_tokens,
-                               self.max_model_len, self.max_num_batched_tokens)
-        proposal = NgramProposer(config).propose([context])
+                               self.max_model_len, self.max_speculative_tokens)
+        proposal = (self.draft_proposer or NgramProposer(config)).propose([context])
         candidates = proposal.tokens_for(0)
         if not candidates:
             return fallback("no_draft_or_budget")
-        plan = VerificationPlan(seq.seq_id, seq.num_cached_tokens, seq.last_token, candidates)
+        plan = VerificationPlan(seq.seq_id, seq.num_cached_tokens, seq.last_token, candidates,
+                                proposal.probabilities)
         if not self.block_manager.reserve_trial(seq, plan.trial_end):
             return fallback("kv_capacity_or_shared_tail")
         self.running.popleft()
@@ -80,20 +83,22 @@ class Scheduler:
             return fallback("batch_or_prefill")
         from hybridinfer.spec_decode.interfaces import DraftContext, VerificationPlan
         from hybridinfer.spec_decode.ngram import NgramProposer
-        seqs = list(self.running)[:min(self.max_num_seqs, self.max_num_batched_tokens)]
-        if any(seq.temperature != 0 for seq in seqs):
+        seqs = list(self.running)[:min(self.max_num_seqs, self.max_num_batched_tokens, self.max_speculative_tokens)]
+        if any(seq.temperature != 0 for seq in seqs) and config.verification_mode != "packed":
             return fallback("temperature")
-        remaining = self.max_num_batched_tokens
+        remaining = self.max_speculative_tokens
         plans = []
-        proposer = NgramProposer(config)
+        proposer = self.draft_proposer or NgramProposer(config)
         for row, seq in enumerate(seqs):
             # Reserve at least one anchor row for each later request.
             budget = remaining-(len(seqs)-row-1)
             context = DraftContext(seq.seq_id, tuple(seq.token_ids), seq.num_cached_tokens,
                                    seq.max_tokens-seq.num_completion_tokens,
                                    self.max_model_len, budget)
-            candidates = proposer.propose([context]).tokens_for(0)
-            plan = VerificationPlan(seq.seq_id, seq.num_cached_tokens, seq.last_token, candidates)
+            proposal = proposer.propose([context])
+            candidates = proposal.tokens_for(0)
+            plan = VerificationPlan(seq.seq_id, seq.num_cached_tokens, seq.last_token, candidates,
+                                    proposal.probabilities)
             plans.append(plan)
             remaining -= len(plan.input_tokens)
         if not any(p.candidates for p in plans):

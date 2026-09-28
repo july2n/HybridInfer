@@ -81,11 +81,15 @@ finally:
 - [GDN 内核与共享预填充实现](docs/gdn_kernel_optimization.md)
 - [投机解码实施计划](docs/speculative_decoding_plan.md)
 - [投机解码实现进度与验收边界](docs/speculative_decoding_progress.md)
+- [vLLM 对齐重测与 EAGLE-3/P-EAGLE/DFlash/DFlash2/DSpark/MTP 适配](docs/vllm_speculative_alignment.md)
 - [模型数值验收记录](docs/qwen35_acceptance.md)
 
 ## 后续计划
 
 - [x] 单请求 n-gram 贪心投机解码执行链路（默认关闭；开启后保守验证，native packed 仍为实验选项）。
-- [x] 变长多请求 n-gram 贪心验证、GPU 接受/提交与异步输出句柄（GDN 重放仍需取回长度，完整系统验收见实施记录）。
-- [ ] 随机投机采样及 MTP/EAGLE/DFlash 草稿。
+- [x] 变长多请求 n-gram 贪心验证、GPU 接受/提交与异步输出句柄（native GDN 已按原验证端点在 GPU 恢复，完整系统验收见实施记录）。
+- [x] 共享随机拒绝采样与真实 Qwen3.5 MTP 初版（eager、关闭前缀缓存；完整严格生成门槛未通过）。
+- [ ] EAGLE-3/P-EAGLE、DFlash/DFlash2/DSpark 模型草稿。
+
+公共链路和 MTP 的实现、复测与限制见 [实施与验收](docs/speculative_mtp_implementation.md)。
 - [ ] 支持 MoE 模型。

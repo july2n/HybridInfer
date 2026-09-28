@@ -2,7 +2,7 @@
 
 This module implements the hybrid Qwen3.5 decoder used by the dense text
 checkpoints: Gated DeltaNet linear-attention blocks interleaved with gated
-GQA blocks. Vision, MoE and MTP are intentionally out of scope here.
+GQA blocks. Vision and MoE are out of scope; the separate MTP module shares this backbone.
 """
 
 from __future__ import annotations
@@ -389,7 +389,11 @@ class Qwen3_5Model(nn.Module):
                     "GDN prefill requires Python-side prefill_slices"
                 )
 
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
+            if context.target_features is not None and index in context.feature_layers:
+                # EAGLE boundaries are the input to the indexed decoder layer.
+                context.target_features[index] = (hidden_states if residual is None
+                                                  else hidden_states + residual)
             hidden_states, residual = layer(
                 positions,
                 hidden_states,
@@ -398,6 +402,8 @@ class Qwen3_5Model(nn.Module):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+        if context.target_features is not None:
+            context.target_features["final"] = hidden_states
         return hidden_states
 
 

@@ -5,6 +5,7 @@ import torch
 
 from hybridinfer.utils.context import BatchDescriptor, set_context, reset_context
 from .state import GDNTransaction
+from .endpoints import begin_endpoints, select_endpoints
 from .verifier import accept_greedy
 from .interfaces import VerificationPlan
 from .metadata import VerificationBatch
@@ -31,7 +32,9 @@ def packed_forward(runner, seq, plan, state_slot, *, project=True):
                                                   dtype=torch.int32, device=device),
                 batch_descriptor=BatchDescriptor(mode='spec_decode', num_tokens=count, num_reqs=1,
                                                  uniform_token_count=count, max_query_len=count))
+    endpoints = begin_endpoints(runner, count)
     hidden = runner.model(torch.tensor(plan.input_tokens, dtype=torch.int64, device=device), positions)
+    runner._trial_endpoints = endpoints
     if not project:
         return None
     metadata = VerificationBatch.from_plans([plan]).tensors(device)
@@ -161,7 +164,14 @@ def verify_speculative(runner, seq, plan):
                 else:
                     for i, token in enumerate(plan.input_tokens[:count]):
                         forward(token, i, slot, project=False)
-            txn.commit(all_inputs_committed=count == len(plan.input_tokens), replay=replay)
+            endpoints = getattr(runner, '_trial_endpoints', {})
+            selected = used_packed and len(endpoints) == len(runner.gdn_layers)
+            if selected:
+                select_endpoints(endpoints, torch.tensor([slot], device=device),
+                                 torch.tensor([count-1], device=device))
+                txn.commit(all_inputs_committed=False, replay=lambda: None)
+            else:
+                txn.commit(all_inputs_committed=count == len(plan.input_tokens), replay=replay)
             committed = clock()
             # Candidates were never placed in the resident token buffer.
             begin = plan.computed_length + 1
@@ -178,7 +188,7 @@ def verify_speculative(runner, seq, plan):
         stats['accepted_tokens'] += result.accepted_draft_tokens
         stats['output_tokens'] += result.output_length
         stats['trial_tokens'] += len(plan.input_tokens)
-        stats['replay_tokens'] += count if count < len(plan.input_tokens) else 0
+        stats['replay_tokens'] += count if count < len(plan.input_tokens) and not selected else 0
         stats['copy_seconds'] += elapsed(start, copied)
         stats['verify_seconds'] += elapsed(copied, verified)
         stats['restore_seconds'] += elapsed(verified, committed)
@@ -200,4 +210,5 @@ def verify_speculative(runner, seq, plan):
         runner.sampled_token_ids_gpu[slot].copy_(original_last)
         raise
     finally:
+        runner._trial_endpoints = {}
         reset_context()

@@ -34,6 +34,9 @@ class Context:
     # them in the context avoids calling CUDA-tensor.tolist() in model.forward.
     prefill_slices: list[tuple[int, int]] | None = None
     prefill_chunk_indices: torch.Tensor | None = None
+    state_endpoints: dict | None = None
+    feature_layers: tuple[int, ...] = ()
+    target_features: dict | None = None
 
 _CONTEXT = Context()
 

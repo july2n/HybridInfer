@@ -36,7 +36,8 @@ import torch.nn.functional as F
 from torch import nn
 
 from hybridinfer.layers.layernorm import RMSNormGated
-from hybridinfer.layers.gdn_kernels import packed_causal_conv, indexed_gdn_decode
+from hybridinfer.layers.gdn_kernels import (packed_causal_conv, indexed_gdn_decode,
+                                           conv_endpoints, packed_gdn_recurrent)
 from hybridinfer.utils.context import get_context
 
 
@@ -289,6 +290,9 @@ class GatedDeltaNet(nn.Module):
         total_tokens = raw_qkv_packed.shape[0]
         if context.state_indices is None or self.recurrent_states.numel() == 0:
             raise RuntimeError("GDN prefill requires allocated state pools and state_indices")
+        descriptor = context.batch_descriptor
+        if descriptor is not None and descriptor.mode == "spec_decode":
+            return self._forward_verify(attention_pre)
         qkv = packed_causal_conv(
             raw_qkv_packed, self.conv1d.weight, self.conv_states,
             context.state_indices, context.cu_seqlens_q,
@@ -378,3 +382,60 @@ class GatedDeltaNet(nn.Module):
         out = self.norm(out, z)
         out = out.reshape(B, 1, -1)  # (B, S, value_dim)
         return self.out_proj(out)
+
+    def _forward_verify(self, attention_pre):
+        """Short recurrent update, retaining the original trial's endpoints.
+
+        Dense projections are packed once; recurrence uses the same one-token
+        arithmetic as decode, retaining per-token states inside a fused scan.
+        """
+        raw, z, b, a = attention_pre
+        ctx = get_context()
+        if self.recurrent_states.dtype == torch.float32 and self.decode_backend == "pool":
+            conv = conv_endpoints(raw, self.conv_states, ctx.state_indices, ctx.cu_seqlens_q)
+            mixed = packed_causal_conv(raw, self.conv1d.weight, self.conv_states,
+                ctx.state_indices, ctx.cu_seqlens_q, ctx.batch_descriptor.max_query_len,
+                round_before_silu=False)
+            q, k, v = torch.split(mixed, [self.key_dim, self.key_dim, self.value_dim], -1)
+            q = q.reshape(raw.shape[0], self.num_k_heads, self.head_k_dim).contiguous()
+            k = k.reshape_as(q).contiguous()
+            v = v.reshape(raw.shape[0], self.num_v_heads, self.head_v_dim).contiguous()
+            outputs, recurrent = packed_gdn_recurrent(q, k, v, a, b, self.A_log, self.dt_bias,
+                self.recurrent_states, ctx.state_indices, ctx.cu_seqlens_q)
+            if ctx.state_endpoints is not None:
+                ctx.state_endpoints[self.layer_idx] = (self, conv, recurrent)
+            out = self.norm(outputs.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
+            return self.out_proj(out.reshape(1, raw.shape[0], self.value_dim))
+        outputs = torch.empty((raw.shape[0], self.num_v_heads, self.head_v_dim),
+                              dtype=raw.dtype, device=raw.device)
+        conv = torch.empty((raw.shape[0], *self.conv_states.shape[1:]),
+                           dtype=self.conv_states.dtype, device=raw.device)
+        recurrent = torch.empty((raw.shape[0], *self.recurrent_states.shape[1:]),
+                                dtype=self.recurrent_states.dtype, device=raw.device)
+        for row, (start, end) in enumerate(ctx.prefill_slices):
+            slot = ctx.state_indices[row:row+1]
+            for t in range(start, end):
+                qkv = packed_causal_conv(raw[t:t+1], self.conv1d.weight,
+                                        self.conv_states, slot, None, 1, decode=True, round_before_silu=False)
+                q, k, v = torch.split(qkv, [self.key_dim, self.key_dim, self.value_dim], -1)
+                q = q.reshape(1, 1, self.num_k_heads, self.head_k_dim).contiguous()
+                k = k.reshape_as(q).contiguous()
+                v = v.reshape(1, 1, self.num_v_heads, self.head_v_dim).contiguous()
+                if (self.recurrent_states.dtype == torch.float32
+                        and self.head_k_dim == self.head_v_dim == 128
+                        and self.decode_backend == "pool"):
+                    out = indexed_gdn_decode(q, k, v, a[t:t+1], b[t:t+1],
+                        self.A_log, self.dt_bias, self.recurrent_states, slot)
+                else:
+                    q = q.repeat_interleave(self.gqa_ratio, 2)
+                    k = k.repeat_interleave(self.gqa_ratio, 2)
+                    out, state = decode_gated_delta_rule(q, k, v, a[t:t+1].clone(), b[t:t+1].clone(),
+                        self.A_log, self.dt_bias, self.recurrent_states.index_select(0, slot))
+                    self.recurrent_states.index_copy_(0, slot, state)
+                outputs[t:t+1].copy_(out.reshape(1, self.num_v_heads, self.head_v_dim))
+                conv[t:t+1].copy_(self.conv_states.index_select(0, slot))
+                recurrent[t:t+1].copy_(self.recurrent_states.index_select(0, slot))
+        if ctx.state_endpoints is not None:
+            ctx.state_endpoints[self.layer_idx] = (self, conv, recurrent)
+        out = self.norm(outputs.reshape(-1, self.head_v_dim), z.reshape(-1, self.head_v_dim))
+        return self.out_proj(out.reshape(1, raw.shape[0], self.value_dim))

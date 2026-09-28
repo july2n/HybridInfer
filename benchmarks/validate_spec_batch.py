@@ -23,6 +23,7 @@ from validate_spec_decode import snapshot, equal_state
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='models/Qwen3.5-0.8B')
+    parser.add_argument('--state-snapshot-budget-mb', type=int, default=256)
     parser.add_argument('--output-tokens', type=int, default=48)
     parser.add_argument('--modes', nargs='+', default=['sequential', 'packed_guarded'],
                         choices=['sequential', 'packed_guarded', 'packed'])
@@ -39,7 +40,7 @@ def main():
         engine = LLMEngine(args.model, max_num_seqs=max(args.batch_sizes), max_model_len=1024,
                            max_num_batched_tokens=256, gpu_memory_utilization=0.6,
                            enforce_eager=not args.decode_graphs, enable_prefix_cache=True,
-                           speculative=SpeculativeConfig(enabled=True))
+                           speculative=SpeculativeConfig(enabled=True, state_snapshot_budget_mb=args.state_snapshot_budget_mb))
         runner = engine.model_runner
         original = runner.verify_speculative_batch
         original_remove = runner.remove_request
@@ -95,16 +96,14 @@ def main():
                                for p, r in zip(plans, results)]
                     if active_mode == 'packed':
                         packed_batch_forward(runner, seqs, VerificationBatch.from_plans(plans), private, project=False)
-                        partial = [i for i, (p, r) in enumerate(zip(plans, results))
-                                   if r.output_length < len(p.input_tokens)]
-                        if partial:
-                            for i in partial:
-                                for layer, conv, recurrent in zip(runner.gdn_layers, before[i]['conv'], before[i]['recurrent']):
-                                    layer.conv_states[private[i]].copy_(conv)
-                                    layer.recurrent_states[private[i]].copy_(recurrent)
-                            packed_batch_forward(runner, [seqs[i] for i in partial],
-                                                 VerificationBatch.from_plans([commits[i] for i in partial]),
-                                                 [private[i] for i in partial], project=False)
+                        endpoints = runner._trial_endpoints
+                        offset = 0
+                        for dst, plan, result in zip(private, plans, results):
+                            index = offset+result.output_length-1
+                            for layer, conv, recurrent in endpoints.values():
+                                layer.conv_states[dst].copy_(conv[index])
+                                layer.recurrent_states[dst].copy_(recurrent[index])
+                            offset += len(plan.input_tokens)
                     else:
                         _decode_batch_anchors(runner, seqs, plans, private)
                     for s, state, dst in zip(seqs, actual, private):
@@ -117,6 +116,7 @@ def main():
                                 failures.append(f'{s.seq_id}:{key}')
                 finally:
                     flat_kv.index_copy_(2, mapping, saved_kv)
+                    runner._trial_endpoints = {}
                     reset_context()
                 record['endpoints'].append(dict(mode=active_mode, requests=len(seqs),
                                                  draft_counts=[len(p.candidates) for p in plans],
@@ -159,7 +159,7 @@ def main():
                 cold_warm_states = [equal_state(a, b) for a, b in zip(cold_states, baseline_states)]
                 for mode in args.modes:
                     active_mode = mode
-                    config = SpeculativeConfig(enabled=True, verification_mode=mode)
+                    config = SpeculativeConfig(enabled=True, verification_mode=mode, state_snapshot_budget_mb=args.state_snapshot_budget_mb)
                     engine.config.speculative = engine.scheduler.speculative = config
                     start = len(record['endpoints'])
                     hits = checkpoints.hits if checkpoints is not None else 0

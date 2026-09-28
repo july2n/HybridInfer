@@ -61,6 +61,25 @@ def accept_greedy_batch(batch, metadata, predictions, *, remaining_output_tokens
         accepted_prefix = matches.to(torch.int64).cumprod(1).sum(1)
     else:
         accepted_prefix = torch.zeros(len(batch.plans), dtype=torch.int64, device=device)
+    return finish_batch(batch, padded, accepted_prefix,
+                        remaining_output_tokens=remaining, max_model_len=max_model_len,
+                        eos=eos, ignore_eos=ignored)
+
+
+def finish_batch(batch, padded, accepted_prefix, *, remaining_output_tokens,
+                 max_model_len, eos=-1, ignore_eos=None):
+    """Apply stop rules after rejection; select the last computed input."""
+    device = padded.device
+    width = padded.shape[1]
+    pos = torch.arange(width, device=device)[None, :]
+    remaining = tuple(remaining_output_tokens)
+    ignored = tuple(ignore_eos) if ignore_eos is not None else (False,)*len(batch.plans)
+    if len(remaining) != len(batch.plans) or len(ignored) != len(batch.plans):
+        raise ValueError('Sampling budgets must match the batch')
+    if any(r < 1 or p.trial_end > max_model_len or p.computed_length >= max_model_len
+           for p, r in zip(batch.plans, remaining)):
+        raise ValueError('No output/context budget or trial exceeds context')
+    valid_rows = pos <= torch.tensor(batch.draft_counts, device=device)[:, None]
     computed = torch.tensor([p.computed_length for p in batch.plans], device=device)
     remaining_t = torch.tensor(remaining, device=device)
     lengths = torch.minimum(accepted_prefix+1, torch.minimum(remaining_t, max_model_len-computed))

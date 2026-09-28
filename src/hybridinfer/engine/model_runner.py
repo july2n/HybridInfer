@@ -95,6 +95,10 @@ class ModelRunner:
                                  output_tokens=0, trial_tokens=0, replay_tokens=0,
                                  copy_seconds=0., verify_seconds=0.,
                                  restore_seconds=0., commit_seconds=0.)
+        self.draft_proposer = None
+        if config.speculative and config.speculative.enabled and config.speculative.method == "mtp":
+            from hybridinfer.spec_decode.mtp import MTPProposer
+            self.draft_proposer = MTPProposer(self)
         self.allocate_gdn_state_pool()
         self.allocate_prefix_snapshots()
         self.warmup_model()
@@ -131,6 +135,8 @@ class ModelRunner:
         # containers. Clear every runner-owned GPU reference, including the
         # lazily-created piecewise graphs, before the engine is discarded.
         self._pending = None
+        self.draft_proposer = None
+        self._trial_endpoints = {}
         self.cuda_graphs.clear()
         for name in ("gdn_layers",):
             value = getattr(self, name, None)
@@ -227,8 +233,13 @@ class ModelRunner:
             * head_dim
             * hf_config.dtype.itemsize
         )
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        snapshot_reserve = (config.speculative.state_snapshot_budget_mb*1024**2
+                            if config.speculative and config.speculative.enabled else 0)
+        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current
+                                       - snapshot_reserve) // block_bytes
+        if config.num_kvcache_blocks <= 0:
+            raise ValueError("GPU memory budget cannot fit target KV after state snapshot reserve; "
+                             "reduce state_snapshot_budget_mb or request capacity")
         self.kv_cache = torch.empty(
             2, num_attn_layers, config.num_kvcache_blocks,
             self.block_size, num_kv_heads, head_dim,
@@ -342,6 +353,12 @@ class ModelRunner:
 
         if mode == "spec_decode":
             return self.model.compute_logits(self.model(input_ids, positions))
+
+        if getattr(self, 'draft_proposer', None) is not None:
+            hidden = self.model(input_ids, positions)
+            self.draft_proposer.record(self.batch_slots_gpu[:context.batch_descriptor.num_reqs],
+                                      positions, hidden, context.prefill_slices if is_prefill else None)
+            return self.compute_logits(hidden, is_prefill)
 
         if self.enforce_eager or not self.cuda_graphs.decode_graphs:
             return self.compute_logits(self.model(input_ids, positions), is_prefill)
@@ -471,6 +488,8 @@ class ModelRunner:
     def remove_request(self, seq_id: int):
         slot = self.input_batch.seq_id_to_slot.get(seq_id)
         if slot is not None:
+            if getattr(self, 'draft_proposer', None) is not None:
+                self.draft_proposer.release(slot)
             self.request_state.remove(slot)
         self.input_batch.remove(seq_id)
 

@@ -68,6 +68,14 @@ class LLMEngine:
         )
         self.config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(self.config)
+        self.scheduler.draft_proposer = self.model_runner.draft_proposer
+        if self.config.speculative and self.config.speculative.enabled:
+            per_token = sum(layer.conv_states[0].numel()*layer.conv_states.element_size()
+                            + layer.recurrent_states[0].numel()*layer.recurrent_states.element_size()
+                            for layer in self.model_runner.gdn_layers)
+            if per_token:
+                self.scheduler.max_speculative_tokens = min(self.config.max_num_batched_tokens,
+                    self.config.speculative.state_snapshot_budget_mb*1024**2//per_token)
         # MRV2 async batch queue: up to max_concurrent_batches batches in
         # flight, CPU runs ahead of GPU by N-1 steps (core.py:622-736).
         self.max_concurrent_batches = 2
@@ -150,7 +158,10 @@ class LLMEngine:
         """
         # Speculative transactions start only after queued batches drain.
         # Single-request diagnostics keep their established reference hook.
-        if not self.batch_queue and len(self.scheduler.running) > 1:
+        if not self.batch_queue and (len(self.scheduler.running) > 1 or
+                (getattr(self.config, "speculative", None) and (self.config.speculative.method == "mtp" or
+                 (self.config.speculative.verification_mode == "packed" and
+                  any(s.temperature != 0 for s in self.scheduler.running))))):
             batch = self.scheduler.begin_speculative_batch()
             if batch is not None:
                 seqs, plans = batch

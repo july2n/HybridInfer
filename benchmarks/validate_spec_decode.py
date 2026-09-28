@@ -66,11 +66,13 @@ def same_block_reference(runner, seq, plan, result, before):
         layer.conv_states[private_slot].copy_(conv)
         layer.recurrent_states[private_slot].copy_(recurrent)
     count = result.committed_computed_length-plan.computed_length
-    replay = VerificationPlan(plan.request_id, plan.computed_length, plan.anchor, plan.candidates[:count-1])
-    packed_forward(runner, seq, replay, private_slot, project=False)
+    # Preserve the original packed shape; a shorter replay is not an endpoint oracle.
+    packed_forward(runner, seq, plan, private_slot, project=False)
     ref = snapshot(runner, seq)
-    ref['conv'] = [layer.conv_states[private_slot].cpu().clone() for layer in runner.gdn_layers]
-    ref['recurrent'] = [layer.recurrent_states[private_slot].cpu().clone() for layer in runner.gdn_layers]
+    endpoints = runner._trial_endpoints
+    ref['conv'] = [endpoints[layer.layer_idx][1][count-1].cpu().clone() for layer in runner.gdn_layers]
+    ref['recurrent'] = [endpoints[layer.layer_idx][2][count-1].cpu().clone() for layer in runner.gdn_layers]
+    runner._trial_endpoints = {}
     return ref
 
 

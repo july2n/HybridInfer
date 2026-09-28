@@ -1,6 +1,6 @@
 """Ragged linear verification: one target forward, GPU accept and commit.
 
-Native recovery reads lengths back to build GDN replay inputs. Conservative
+Native recovery selects original trial endpoints on the GPU. Conservative
 modes fall back to ordinary batched anchors to preserve numeric batch shape.
 Output D2H and the final commit fence have independent asynchronous ownership.
 """
@@ -12,10 +12,12 @@ import torch
 from hybridinfer.utils.context import BatchDescriptor, set_context, reset_context
 from .async_output import AsyncVerificationOutput
 from .batch_verifier import accept_greedy_batch
+from .rejection import accept_random_batch
 from .commit import commit_batch
 from .interfaces import VerificationPlan
 from .metadata import VerificationBatch
 from .state import GDNTransaction
+from .endpoints import begin_endpoints, select_endpoints
 
 
 @torch.inference_mode()
@@ -46,7 +48,12 @@ def packed_batch_forward(runner, seqs, batch, state_slots, *, project=True):
                 batch_descriptor=BatchDescriptor('spec_decode', len(inputs), len(seqs),
                                                  counts[0] if len(set(counts)) == 1 else None,
                                                  max(counts)))
+    endpoints = begin_endpoints(runner, len(inputs))
     hidden = runner.model(make(inputs), make(positions))
+    runner._trial_endpoints = endpoints
+    proposer = getattr(runner, 'draft_proposer', None)
+    if proposer is not None:
+        proposer.record(slots, make(positions), hidden, slices)
     if not project:
         return None
     # Do not reuse ordinary prefill's final-row-only projection.
@@ -66,7 +73,11 @@ def _decode_batch_anchors(runner, seqs, plans, state_slots):
                 state_indices=make(state_slots),
                 batch_descriptor=BatchDescriptor('spec_decode', len(seqs), len(seqs), 1, 1))
     hidden = runner.model(make([p.anchor for p in plans]), make([p.computed_length for p in plans]))
-    return runner.model.compute_logits(hidden).argmax(-1)
+    proposer = getattr(runner, 'draft_proposer', None)
+    if proposer is not None:
+        proposer.record(make(slots), make([p.computed_length for p in plans]), hidden)
+    runner._anchor_logits = runner.model.compute_logits(hidden)
+    return runner._anchor_logits.argmax(-1)
 
 
 def _trial_kv(runner, seq, plan):
@@ -88,8 +99,8 @@ def verify_speculative_batch(runner, seqs, plans):
     if runner._pending is not None or runner.world_size != 1:
         raise RuntimeError('verification requires an idle single-GPU runner')
     for seq, plan in zip(seqs, plans):
-        if seq.temperature != 0:
-            raise ValueError('speculative verification requires temperature=0')
+        if seq.temperature != 0 and runner.config.speculative.verification_mode != 'packed':
+            raise ValueError('Random speculative sampling requires packed verification')
         if (plan.request_id != seq.seq_id or plan.computed_length != seq.num_cached_tokens
                 or seq.num_tokens != plan.computed_length+1 or plan.anchor != seq.last_token
                 or plan.trial_end > runner.config.max_model_len):
@@ -141,7 +152,8 @@ def verify_speculative_batch(runner, seqs, plans):
             resource_failure = False
             if mode != 'sequential':
                 try:
-                    native = packed_batch_forward(runner, seqs, batch, private).argmax(-1)
+                    native_logits = packed_batch_forward(runner, seqs, batch, private)
+                    native = native_logits.argmax(-1)
                     if guarded:
                         saved_states = [None if p.candidates else
                                         [pool[dst].clone() for pool, _ in txn.original]
@@ -197,11 +209,41 @@ def verify_speculative_batch(runner, seqs, plans):
             acceptance_batch = VerificationBatch.from_plans(
                 [VerificationPlan(p.request_id, p.computed_length, p.anchor, ()) for p in plans]
             ) if anchor_only else batch
-            acceptance = accept_greedy_batch(
-                acceptance_batch, acceptance_batch.tensors(device), predictions,
-                remaining_output_tokens=[s.max_tokens-s.num_completion_tokens for s in seqs],
-                max_model_len=runner.config.max_model_len, eos=runner.config.eos,
-                ignore_eos=[s.ignore_eos for s in seqs])
+            if any(s.temperature != 0 for s in seqs) and used_packed:
+                draft_probs = None
+                if any(p.draft_probabilities is not None for p in plans):
+                    probs = []
+                    for p in plans:
+                        q = p.draft_probabilities
+                        if q is None:
+                            q = torch.zeros((len(p.candidates), native_logits.shape[1]), device=device)
+                            if p.candidates:
+                                q.scatter_(1, torch.tensor(p.candidates, device=device)[:, None], 1.)
+                        probs.append(q)
+                    draft_probs = torch.cat(probs)
+                acceptance = accept_random_batch(batch, batch.tensors(device), native_logits,
+                    draft_probs=draft_probs,
+                    temperatures=[s.temperature for s in seqs],
+                    seeds=[s.seed if s.seed is not None else torch.initial_seed()+s.seq_id for s in seqs],
+                    remaining_output_tokens=[s.max_tokens-s.num_completion_tokens for s in seqs],
+                    max_model_len=runner.config.max_model_len, eos=runner.config.eos,
+                    ignore_eos=[s.ignore_eos for s in seqs])
+            elif any(s.temperature != 0 for s in seqs):
+                # Resource fallback is an ordinary sampled anchor, not argmax.
+                hidden_logits = runner._anchor_logits
+                sampled = runner.sampler.sample(hidden_logits, slots_t,
+                    state.temperatures.tensor, state.seeds.tensor,
+                    state.computed.tensor+1)
+                acceptance = accept_greedy_batch(acceptance_batch, acceptance_batch.tensors(device), sampled,
+                    remaining_output_tokens=[s.max_tokens-s.num_completion_tokens for s in seqs],
+                    max_model_len=runner.config.max_model_len, eos=runner.config.eos,
+                    ignore_eos=[s.ignore_eos for s in seqs])
+            else:
+                acceptance = accept_greedy_batch(
+                    acceptance_batch, acceptance_batch.tensors(device), predictions,
+                    remaining_output_tokens=[s.max_tokens-s.num_completion_tokens for s in seqs],
+                    max_model_len=runner.config.max_model_len, eos=runner.config.eos,
+                    ignore_eos=[s.ignore_eos for s in seqs])
             partial_seqs, partial_plans, partial_slots = [], [], []
             if anchor_only:
                 # This is an ordinary target fallback, with zero accepted
@@ -210,22 +252,29 @@ def verify_speculative_batch(runner, seqs, plans):
                 for txn in transactions:
                     txn.commit(all_inputs_committed=True, replay=None)
             else:
-                # Native GDN recovery still needs one length transfer.
-                counts = acceptance.lengths.cpu().tolist()
-                for seq, plan, src, txn, count in zip(seqs, plans, slots, transactions, counts):
-                    if count == len(plan.input_tokens):
-                        txn.commit(all_inputs_committed=True, replay=None)
-                    else:
-                        partial_seqs.append(seq)
-                        partial_plans.append(VerificationPlan(plan.request_id, plan.computed_length,
-                                                              plan.anchor, plan.candidates[:count-1]))
-                        partial_slots.append(src)
-                if partial_plans:
-                    packed_batch_forward(runner, partial_seqs, VerificationBatch.from_plans(partial_plans),
-                                         partial_slots, project=False)
-                    for txn, count, plan in zip(transactions, counts, plans):
-                        if count < len(plan.input_tokens):
-                            txn.commit(all_inputs_committed=False, replay=lambda: None)
+                endpoints = getattr(runner, '_trial_endpoints', {})
+                if len(endpoints) == len(runner.gdn_layers):
+                    starts = torch.tensor([0, *batch.scheduled_counts[:-1]], device=device).cumsum(0)
+                    select_endpoints(endpoints, slots_t, starts + acceptance.lengths - 1)
+                    for txn in transactions:
+                        txn.commit(all_inputs_committed=False, replay=lambda: None)
+                else:
+                    # Native GDN recovery still needs one length transfer.
+                    counts = acceptance.lengths.cpu().tolist()
+                    for seq, plan, src, txn, count in zip(seqs, plans, slots, transactions, counts):
+                        if count == len(plan.input_tokens):
+                            txn.commit(all_inputs_committed=True, replay=None)
+                        else:
+                            partial_seqs.append(seq)
+                            partial_plans.append(VerificationPlan(plan.request_id, plan.computed_length,
+                                                                  plan.anchor, plan.candidates[:count-1]))
+                            partial_slots.append(src)
+                    if partial_plans:
+                        packed_batch_forward(runner, partial_seqs, VerificationBatch.from_plans(partial_plans),
+                                             partial_slots, project=False)
+                        for txn, count, plan in zip(transactions, counts, plans):
+                            if count < len(plan.input_tokens):
+                                txn.commit(all_inputs_committed=False, replay=lambda: None)
             committed = clock()
             commit_batch(state, runner.sampled_token_ids_gpu, slots_t, acceptance)
             done = clock()
@@ -261,4 +310,5 @@ def verify_speculative_batch(runner, seqs, plans):
             torch.cuda.current_stream().synchronize()
         raise
     finally:
+        runner._trial_endpoints = {}
         reset_context()
