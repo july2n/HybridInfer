@@ -1,103 +1,42 @@
 # 投机解码实施计划
 
-**当前目标（2026-09-28，用户确认）：数学语义一致 + 正确选择 speculative endpoint + 控制数值误差。**
-不强制 `packed verification == single decode bit-for-bit`，也不要求不同浮点
-执行路径的 greedy 自由生成序列完全相同。接受/拒绝算法、因果性、历史有效
-范围及状态提交仍须正确；浮点差异按概率偏差、翻转、任务质量和性能评估。
-旧逐位对照结果保留为诊断证据，不改写历史失败，也不作为后续 backend 的硬门槛。
+更新：2026-09-29。目标是数学语义一致、正确选择原 trial 端点、控制数值误差，
+并通过实测建立性能收益。跨浮点路径的逐位或 greedy 全序列一致性作为诊断指标。
+预测行、端点、历史范围、EOS/长度与采样算法仍严格验收。
 
-**2026-09-28 目标更新：最终适配 EAGLE-3、P-EAGLE、DFlash、DFlash2、DSpark、MTP；n-gram 仅作为公共链路测试后端。** 新的固定 vLLM 新旧 runner 对齐检查、六种方法的独立特征/缓存/分布契约及实施顺序见 [vLLM 对齐审计](vllm_speculative_alignment.md)。后续按“公共 target recurrent 验证与状态选择 → 设备草稿/特征接口与拒绝 sampler → 本地真实 MTP → EAGLE-3/P-EAGLE → DFlash/DFlash2/DSpark”推进；不继续以 n-gram 性能优化作为最终交付。
+当前实现见 [进度](speculative_decoding_progress.md) 和 [公共链路与 MTP](speculative_mtp_implementation.md)，
+结果见 [MTP 评估](mtp1_evaluation.md)，脚本见 [验收指南](../benchmarks/README.md)。
 
-**最新实施：** 公共 recurrent target、原 trial 端点选择、共享随机拒绝及真实 MTP 已接入；conv 已采用共享扩展历史。MTP-1 完成状态、数值、质量 smoke test 和性能评估，已推进 K=2/4 扫描，详见 [MTP-1 评估](mtp1_evaluation.md)。完整系统与质量推广验收仍需补齐。
+## 1. 当前范围
 
-本文定义当前实施范围和验收门槛；[实施记录](speculative_decoding_progress.md)中的旧逐位门槛与结果保留为历史。最终支持六种模型草稿方法，n-gram 用于公共链路测试。投机功能默认关闭，开启后默认仍为 `packed_guarded`；默认配置调整须依据实际质量与收益评估。
+已实现 Qwen3.5 Dense、单 GPU、线性候选、变长批量 target 验证、共享随机拒绝采样
+和真实 checkpoint MTP。n-gram 用于公共链路测试。投机默认关闭，开启后默认
+`packed_guarded`；显式 `packed` 执行多词元接受与原 trial 端点提交。
 
-## 1. 目标与范围
+MTP 当前要求 eager、关闭 prefix cache，使用单个预测层、共享 embedding/head、
+独立 draft KV 和 target feature 历史。草稿为 greedy 点质量，可服务随机 target。
+当前不混合 prefill 与投机验证。树候选需独立 mask、位置和 GDN 分支状态。
+最终草稿范围为 MTP、EAGLE-3、P-EAGLE、DFlash、DFlash2、DSpark；后五种尚未实现。
 
-建立“生成草稿 → 主模型批量验证 → 接受/拒绝 → 状态提交”的通用机制。草稿方法可以替换，主模型验证、历史状态管理、调度和输出协议保持共用。
+## 2. 公共架构
 
-目标分为三个独立验收维度：
+| 模块 | 当前职责 |
+|---|---|
+| `config.py`、`interfaces.py` | 方法、候选上限、预算、CPU/设备草稿与后端能力 |
+| `metadata.py` | 变长累计长度、hidden/logits 两套行索引 |
+| `batch_execution.py` | 一次 target 前向、试算与原 trial 端点提交 |
+| `batch_verifier.py`、`rejection.py` | GPU 接受、补偿/bonus 与停止条件 |
+| `state.py`、`endpoints.py` | 状态事务、共享 conv 历史与 recurrent 端点 |
+| `commit.py`、`async_output.py` | 有效历史/长度提交、输出缓冲区及完成事件 |
+| `mtp.py`、`models/qwen3_5_mtp.py` | 特征历史、draft KV、真实模型与权重 |
+| `ngram.py`、`verifier.py` | 历史匹配草稿和 CPU 接受参考 |
 
-1. **数学语义一致。** Target 使用正确的因果历史与预测行；贪心接受连续匹配前缀，随机接受与补偿使用实际 p/q；token/feature shift、EOS、长度截断和 bonus 语义正确。同一组 logits/概率的算法对照应一致，不以容差豁免索引或采样错误。
-2. **正确选择 speculative endpoint。** 在原 packed trial 中保留可恢复端点，按实际接受/输出长度提交 conv、recurrent、KV 有效长度及 CPU/GPU 历史。正式状态必须精确对应被选中的原 trial 端点，不能提交拒绝尾部。正常 native 路径只做 endpoint commit，不重跑 target。
-3. **控制数值误差。** 在相同输入、相同初始状态下测量 packed 与 single decode 的 logits、概率及状态偏差；结合 rolling 累积、near-tie 翻转、自由生成质量和性能判断是否可接受。跨执行路径不强制逐位或逐 token 相同。
+设备候选在调度适配边界仍转为 CPU tuple，当前不是全设备调度。
+所有请求共用 `verify_speculative_batch`；指标由 runner/scheduler 记录。
 
-逐位比较用于定位误差和防止局部回归；它只在相同执行路径的端点复制、索引及明确声明的 kernel 契约中作为硬检查。
+## 3. Target 验证与接受
 
-第一版范围：Qwen3.5 Dense、单 GPU、线性候选链、temperature=0、CPU n-gram 查找、普通执行路径。无匹配、预算不足或资源不足时回退到单词元解码。初始正确性阶段不混合预填充与投机验证，不捕获新的完整验证图。
-
-后续分阶段加入变长批量验证、异步执行、前缀缓存协作、图执行、随机拒绝采样及模型草稿适配。树状候选需要独立的注意力掩码和 GDN 分支状态设计，不能直接沿用线性候选协议。
-
-## 2. 实施前代码与需要改变的契约
-
-下表保留设计时的基线和改动目标；已经实现的部分及尚未通过的验收见实施记录。
-
-| 位置 | 当前实现 | 所需变化 |
-|---|---|---|
-| `engine/sequence.py` | 每次 `append_token`，CPU 维护已确认历史 | 批量追加已提交词元；候选不进入正式历史 |
-| `scheduler/scheduler.py` | 解码固定调度 1 个输入词元 | 根据草稿长度预留验证预算与 KV 容量，提交后推进真实长度 |
-| `engine/model_runner.py` | 普通预填充只投影每请求最后一行；执行后立即 `advance` | 为验证选择全部有效预测行；试算期间不推进正式长度、不保存 prefix 快照 |
-| `engine/input_prep.py`、`request_state.py` | GPU 常驻历史、长度；采样结果单词元提交 | 独立候选输入缓冲区和批量提交内核，拒绝词元不写入正式历史 |
-| `engine/async_output.py`、`llm_engine.py` | 每请求返回一个词元，结束判断按单词元执行 | 返回变长词元段、有效长度与接受统计，逐词元处理 EOS 和长度截断 |
-| `engine/block_manager.py` | 单步追加、完整块哈希发布 | 多词元容量预留、试算块回收，只有已确认且已计算的完整块可发布 |
-| `utils/context.py`、`engine/cuda_graph.py` | 有 `spec_decode` 描述预留，但运行路由仍落入单步 decode 图 | 明确验证模式使用多词元因果路径，禁止误用单词元图 |
-| `utils/loader.py` | 当前跳过 MTP 权重 | 接入 MTP 时增加显式模型分支、独立加载与完整性检查 |
-
-`BatchDescriptor` 中的模式字符串不是投机解码实现。实际模型形状、采样行、状态更新和图路由都需要同步修改。
-
-## 3. 通用架构
-
-已建立 `src/hybridinfer/spec_decode/`，按以下职责继续扩展：
-
-- `config.py`：`SpeculativeConfig`，包含方法、候选数上限、n-gram 范围、草稿模型路径、验证模式、状态恢复策略及显存预算。
-- `interfaces.py`：定义 `DraftContext`、`DraftProposal`、`VerificationPlan`、`VerificationResult` 和后端能力声明。
-- `ngram.py`：仅从已确认 token 历史查找候选。
-- `verifier.py`：CPU 正确性参考；`metadata.py`：变长批次与两层行索引；`batch_verifier.py`：GPU 连续接受前缀、补偿/额外词元和结束条件。
-- `batch_execution.py`：一次打包 target 前向、私有状态与部分接受恢复；`commit.py`：GPU 有效输出批量提交；`async_output.py`：独立变长输出缓冲区与完成事件。
-- `state.py`：验证状态事务、KV 预留和 GDN 状态恢复。
-- `metrics.py`：候选数、接受数、回退原因、各阶段时间与显存。
-- 后续添加 `mtp.py`、`eagle.py`、`dflash.py` 及各自模型实现。
-
-公共接口的概念定义如下，具体字段在实现时依现有批处理布局确定：
-
-```python
-proposal = proposer.propose(draft_context)
-plan = verifier.prepare(proposal, committed_state)
-trial = runner.verify(plan)
-result = verifier.accept(trial, proposal, sampling_params)
-state_manager.commit(plan, result)
-proposer.on_commit(result)
-```
-
-`DraftContext` 包含请求身份、已确认历史、逻辑位置及按需提供的目标模型特征。`DraftProposal` 使用扁平候选 token、请求 offsets/lengths 和可选草稿分布信息；不能假定所有请求候选数相同，也不能只存一个置信度标量代替完整概率契约。
-
-`VerificationResult` 区分草稿接受数、实际输出词元数、实际计算词元数、终止标记及已确认位置。异步输出使用 `[B, max(K_i)+1]` 词元缓冲区与 `[B]` 有效长度，或等价打包布局，每个输出句柄独立持有缓冲区和完成事件。
-
-草稿后端声明是否需要目标隐藏层、哪些层及归一化位置、词表映射、草稿状态、随机采样支持和候选拓扑。不要求所有方法共享同一种内部前向过程。
-
-## 4. n-gram 草稿规则
-
-建议初始参数：候选数上限 K=4，匹配长度范围 2–8；支持配置，后续测量 K=1/2/4/8。
-
-从最长匹配长度向下搜索，将当前历史末尾的 n 个 token 与更早位置比较；同长度多个匹配时选择最近的、存在后续词元的匹配，复制该历史出现后的最多 K 个 token。不使用本次尚未确认的候选扩展搜索历史。
-
-只返回已存在历史中的后续 token，不循环构造无限候选。不足 K 时返回短候选；没有匹配时返回空草稿。按输出剩余长度、模型上下文余量和调度预算裁剪候选。CPU 查找先采用简单独立实现，性能验证后再考虑增量索引或 GPU 查找。
-
-## 5. target model 如何验证一次提出的 K 个候选
-
-### 5.1 vLLM 源码核对基准
-
-本节于 2026-09-28 核对本地 `/home/lang/workspace/vllm`，固定版本为 `a4eb3f25d6f9b3cad7ecf5390423d853935fcaeb`，以下引用指向该提交。核对的是 V1 `GPUModelRunner` 的线性候选验证链路，其他 runner、树状候选和未来版本需另行核对。
-
-| 环节 | 源码入口 | 核对结论 |
-|---|---|---|
-| 行布局与候选对齐 | [`GPUModelRunner._calc_spec_decode_metadata`](https://github.com/vllm-project/vllm/blob/a4eb3f25d6f9b3cad7ecf5390423d853935fcaeb/vllm/v1/worker/gpu_model_runner.py#L2801) | 每请求选择最后 K_i+1 个预测位置，候选 token 对应其预测行的下一输入位置 |
-| 元数据契约 | [`SpecDecodeMetadata`](https://github.com/vllm-project/vllm/blob/a4eb3f25d6f9b3cad7ecf5390423d853935fcaeb/vllm/v1/spec_decode/metadata.py#L9) | 分别保存候选累计长度、采样累计长度、hidden-state 行索引及 target/bonus logits 行索引 |
-| 预测投影 | [`sample_hidden_states` / `compute_logits`](https://github.com/vllm-project/vllm/blob/a4eb3f25d6f9b3cad7ecf5390423d853935fcaeb/vllm/v1/worker/gpu_model_runner.py#L4461) | 从本次前向的 hidden states 选择有效行后投影，不能沿用普通 prefill 只投影最后一行的逻辑 |
-| 接受/拒绝 | [`RejectionSampler.forward` 与 GPU kernels](https://github.com/vllm-project/vllm/blob/a4eb3f25d6f9b3cad7ecf5390423d853935fcaeb/vllm/v1/sample/rejection_sampler.py#L140) | 分离 target 与 bonus 行；GPU 上按请求求最长接受前缀；拒绝后不输出后续候选或 bonus |
-| 长度修正 | [`Scheduler.update_from_output`](https://github.com/vllm-project/vllm/blob/a4eb3f25d6f9b3cad7ecf5390423d853935fcaeb/vllm/v1/core/sched/scheduler.py#L2048) | 根据实际输出扣除拒绝候选对应的试算长度，并处理异步占位长度与过期结果 |
-
-### 5.2 一次因果前向，K+1 行预测
+### 3.1 一次因果前向，K+1 行预测
 
 正常解码入口满足：已计算长度为 C，正式 token 历史长度为 C+1；最后一个已确认 token 是尚未计算的锚点 u。草稿为 d1…dK，历史为 H（包含 u）。target 本轮输入 `[u, d1, ..., dK]`，位置为 C…C+K，复用此前 C 个 token 的缓存，通过一次多词元因果前向得到 K+1 行 hidden states 和 logits。
 
@@ -114,9 +53,9 @@ proposer.on_commit(result)
 
 必须保留这个一位偏移：验证 d_i 使用输入 d_i **前一行**的 logits。把 d_i 自己所在行的 argmax 与 d_i 比较会得到错误验证。K 个候选需要 K 行验证分布，加上 1 行 bonus 分布；bonus 是从现有末行 logits 采样，不需要追加一次 target 前向。
 
-以上 K+1 是正常解码入口的本请求查询长度。vLLM 同一批次可以包含长 prefill 或其他请求，本次 target 总输入行数不一定等于 `sum(K_i+1)`；每请求选择的采样行仍为 K_i+1。初版继续不混合 prefill 与验证，后续混合时必须分清前向行数和采样行数。
+以上 K+1 是正常解码入口的本请求查询长度。vLLM 同一批次可以包含长 prefill 或其他请求，本次 target 总输入行数不一定等于 `sum(K_i+1)`；每请求选择的采样行仍为 K_i+1。当前不混合 prefill 与验证，后续混合时必须分清前向行数和采样行数。
 
-### 5.3 变长批次与两层行索引
+### 3.2 变长批次与两层行索引
 
 参考 vLLM 使用扁平候选和每请求 K_i。令 S=`sum(K_i)`、B 为请求数，则选中 logits 形状为 `[S+B, vocab_size]`，候选为 `[S]`；target 验证行形状为 `[S, vocab_size]`，bonus 行为 `[B, vocab_size]`。
 
@@ -129,17 +68,17 @@ proposer.on_commit(result)
 
 例如 K_i=`[3,0,2]`，选中 logits 共 8 行，target 索引为 `[0,1,2,5,6]`，bonus 索引为 `[3,4,7]`，候选累计长度为 `[3,3,5]`，采样累计长度为 `[4,5,8]`。K_i=0 的请求没有验证行，只从其单行目标分布输出一个 token。vLLM 从选中的输入 token 中用 `target_logits_indices+1` 取出候选，显式落实预测行与输入位置的偏移。
 
-### 5.4 贪心与随机接受逻辑
+### 3.3 贪心与随机接受逻辑
 
 贪心模式对 K 行处理后的 target logits 求 argmax，按位置比较候选，只接受第一次不一致之前的连续前缀。vLLM 的贪心 Triton kernel 每请求遍历候选，在首个不一致位置写入该行 target argmax 作为 correction，后续槽位保留占位值；全接受才写入 bonus。批量前向与 GPU 行比较不改变“只能接受连续前缀”的逻辑。
 
 例如候选 `[A,B,C]`，三行 target argmax 为 `[A,X,C]`，实际输出只能是 `[A,X]`。第三行即使匹配也依赖已拒绝的 B，不可采用；已有 bonus 分布同样失效，不能在 correction 后继续输出 bonus。全接受时输出 `[A,B,C,bonus]`。bonus 在 vLLM 中可以预先采样，但仅全接受时提交。
 
-随机模式不能使用 argmax 相等判定。对候选 d_i 使用 `min(1,p_i(d_i)/q_i(d_i))` 接受概率，首个拒绝位置从归一化的 `max(p_i-q_i,0)` 取 correction；全接受从 p_(K+1) 取 bonus。n-gram 的 `draft_probs=None` 在 vLLM 中对应确定候选的点质量 q，候选处 q(d_i)=1，不代表跳过概率校正。目标 logits 的处理和采样约束必须符合实际配置，后续位置的处理应使用对应假设历史；本项目 P1 仍限定 temperature=0，随机模式留到 P4。
+随机模式不能使用 argmax 相等判定。对候选 d_i 使用 `min(1,p_i(d_i)/q_i(d_i))` 接受概率，首个拒绝位置从归一化的 `max(p_i-q_i,0)` 取 correction；全接受从 p_(K+1) 取 bonus。n-gram 的 `draft_probs=None` 在 vLLM 中对应确定候选的点质量 q，候选处 q(d_i)=1，不代表跳过概率校正。目标 logits 的处理和采样约束必须符合实际配置，后续位置的处理应使用对应假设历史；共享随机拒绝采样已实现；当前 MTP 使用 greedy 点质量草稿。
 
 vLLM 输出缓冲区为 `[B,max(K_i)+1]`，未输出部分填占位 token。本项目可使用等价布局，但必须返回每请求有效长度，不能把占位值、拒绝尾部或未采用的 bonus 当作正式输出。
 
-### 5.5 提交端点与当前实现的边界
+### 3.4 提交端点与当前实现的边界
 
 若接受 a 个候选且无终止截断，输出为 `[d1, ..., da, correction_or_bonus]`，输出数 m=a+1。试算处理了 K+1 个输入，但正式只提交输入 `[u,d1,...,da]` 对应的 m 个位置：已计算长度为 **C+a+1=C+m**，正式历史长度为 **C+a+2=C+1+m**。最后输出的 correction/bonus 尚未作为 target 输入计算，留作下一轮锚点。首位拒绝时仍提交 u 的状态；全接受时提交全部 K+1 个输入状态。
 
@@ -151,9 +90,9 @@ EOS、`max_tokens` 或上下文边界可截断输出，必须按截断后的实�
 诊断，再提交普通单步 anchor，接受候选数为零。两者均为参考/回退路径，不将
 其额外开销计入正常 native 验证成本。
 
-## 6. GDN 与 KV 的事务式提交
+## 4. GDN 与 KV 的事务式提交
 
-### 6.1 当前策略：私有状态试算与原 trial 端点提交
+### 4.1 当前策略：私有状态试算与原 trial 端点提交
 
 验证开始时，每个请求的正式 conv/recurrent 状态复制到私有 trial slot；保存原状态
 用于异常恢复。Packed scan 保存每个 recurrent 端点，conv 保存初始历史和原始
@@ -168,102 +107,66 @@ trial token 的共享扩展历史。正式状态在接受判定前不推进。
 `finish_endpoint_commit()`（端点选择完成）。异常仍恢复原正式状态。状态复制、
 选择及提交成本分别测量，不能仅凭减少验证轮数宣称加速。
 
-### 6.2 KV 管理
+### 4.2 KV 管理
 
-按 C+K+1 的试算输入端点预留页；现有缓存页中已确认的位置不变，试算写入逻辑尾部。共享可写尾页需要检查并按需写时复制。拒绝尾部的物理 KV 可保留为不可见数据，但上下文长度必须立即恢复，后续写入覆盖；无继续使用价值的临时页应回收。
+按 C+K+1 的试算输入端点预留页；现有缓存页中已确认的位置不变，试算写入逻辑尾部。当前共享可写尾页回退普通解码；后续写时复制须独立验收。拒绝尾部的物理 KV 可保留为不可见数据，但上下文长度必须立即恢复，后续写入覆盖；无继续使用价值的临时页应回收。
 
 对试算区域禁止哈希发布和共享。只在正式提交后，按已确认且已计算的长度发布完整 KV 块；GDN prefix 快照必须对应同一端点。默认不增加解码阶段快照发布，在验证事务外保留当前预填充快照机制。
 
 正式 GPU token、computed length、CPU Sequence、KV 页表及 GDN slot 的端点必须一致。事务完成前请求保持 `in_flight`，不能被再次调度、回收或复用；抢占和结束释放需等事务完成事件。
 
-### 6.3 后续恢复优化
+### 4.3 状态预算
 
-vLLM 的混合状态路径也需要按接受端点选择 recurrent state，不能仅回退 KV 长度。例如固定版本的 [`mamba_utils` 状态迁移](https://github.com/vllm-project/vllm/blob/a4eb3f25d6f9b3cad7ecf5390423d853935fcaeb/vllm/v1/worker/mamba_utils.py#L519) 使用 `num_accepted_tokens-1` 的状态偏移；该字段的计数口径必须结合调用方核对，不能直接等同于本项目的草稿接受数 a。可借鉴“保留逐位置状态、按端点选择”的机制，但不能直接套用其 block 布局或索引。
+Conv 保存初始历史加 trial raw tokens，按端点选择历史窗口；recurrent 保存各输入端点。
+默认状态快照预算 256 MiB，调度按实际布局限制验证输入，K 是上限，实际 K_i 可不同。
+本模型 18 层 FP32 recurrent 每请求每端点约 18 MiB，B=8、K=4 的端点约 720 MiB。
+不能假定大批次均有完整候选数；prefix 快照池与试算状态池独立。
+优化存储与选择成本时保持原 trial 端点契约，native 部分接受不重跑 target。
 
-当前 native 路径已保存原 trial 的每个 recurrent 端点，conv 使用共享扩展历史。
-接受后只提交选中的端点，不重跑 target。后续优化存储和选择成本时必须保持该契约；
-资源不足可在验证事务外显式回退普通解码。核算每请求 `层数 × 头数 × V × K × 4 字节 × 保存端点数`，避免快照显存吞掉收益。不能用 prefix 快照池代替临时验证状态池。
+## 5. 下一阶段建议：MTP 性能与覆盖
 
-## 7. 实施阶段与验收门槛
+以下任务尚未实施，按测量结果调整优化优先级：
 
-| 阶段 | 交付内容 | 完成标准 |
-|---|---|---|
-| P0：基础契约 | 配置、公共数据结构、长度/预测行定义、状态事务与确定性参考验证器 | mock logits 覆盖所有接受长度；默认关闭无行为变化 |
-| P1：n-gram 贪心闭环 | CPU 草稿、B=1 公共验证入口、私有 GDN 试算、原端点选择、多词元输出 | 无匹配、全接受、首位/中间拒绝、EOS、长度截断均正确；不会发布拒绝历史 |
-| P2：批量与系统集成 | 一次 target 因果前向、两层预测行索引、变长 K_i 元数据、GPU 接受/输出/提交、异步输出、资源不足回退 | K_i=0/1/4 混批的行映射与有效长度正确；slot 重排、跨页、并发、抢占重算、prefix 开关均通过状态对照 |
-| P3：性能优化 | 逐位置状态/分段恢复、自适应 K、按接受收益回退、分段图验证 | 分项测量证明收益来源；低命中负载不持续承担无效验证成本 |
-| P4：随机投机采样 | 草稿分布协议、拒绝采样、补偿分布、位置稳定随机计数 | 小词表统计验证主模型目标分布；拒绝后随机计数不受未提交候选污染 |
-| P5：MTP | 目标隐藏状态导出、模型专属预测头与权重加载、草稿缓存同步 | 使用兼容且权重完整的模型验证；不能以空接口宣称支持 |
-| P6：EAGLE-3/P-EAGLE | 对应训练草稿的特征层、投影、词表映射及缓存适配；P-EAGLE 并行查询和预算 | 先支持线性候选链，匹配 checkpoint 的特征契约；并行模式须有对应训练权重；树验证另行设计 |
-| P7：DFlash/DFlash2/DSpark | 条件隐藏状态、context/query KV、块级草稿掩码与位置；DFlash2 selector；DSpark Markov/confidence | 每种草稿模型真实加载并分别验收；缓存实际条件 q；草稿掩码不泄漏到主模型因果验证 |
+1. **完整候选扫描与耗时分解。** 五类自然输入，K=1/2/4、B1/B4，固定模型、
+   精度、输入、输出预算、采样与缓存条件；配对轮换并增加重复次数。
+   记录实际 K_i、每轮有效输出、接受率、proposer/target/状态提交时间、CPU 同步、
+   峰值显存与回退。当前性能脚本只支持 B1，B4 需扩展入口。
+2. **普通图路径对照。** 当前 MTP 强制 eager，需扩展测试入口，独立配置普通
+   decode graph baseline 与 MTP eager。保留 eager/eager 对照以定位成本，
+   实际收益以当前最快普通路径为参照。
+3. **优化主要开销。** 依据 profiling 实现按候选步合批的 MTP proposer，复用
+   元数据/缓冲区、减少回传与同步，再推进固定形状 proposer/target CUDA Graph。
+   变长 padding 不得推进正式历史或状态。
+4. **候选长度选择和低收益回退。** 根据有效输出与每轮实际成本选择 K，接受率
+   仅为输入指标；覆盖低匹配、请求结束、资源压力及混合 K_i。
+5. **扩大质量与系统覆盖。** 覆盖 K=2/4、生产 packed LM head、更多客观任务、
+   自然生成退化、随机 target、动态到达、取消/抢占与容量压力。每次优化伴随
+   原 trial 端点、draft-cache 生命周期与数值/质量检查。
 
-P1 首先提供逐词元验证参考路径，再接入批量验证。参考路径不要求加速，是状态和预测行对齐的正确性基准。
+交付需有可复现结果、收益范围及无收益场景，不预设加速倍数。随后推进其他真实草稿后端。
 
-P2 首版已按以下顺序接入，完整系统验收与 P3 优化继续按此顺序推进；实际测试结果以实施记录为准：
+## 6. 后端扩展契约
 
-1. 已将第 5 节的行映射、首位/中间拒绝、全接受 bonus 和端点关系作为显式契约，核对当前 packed 实现；区分预测行错误与 packed/decode 数值差异。
-2. P2 已建立变长 K_i 的打包输入和两层索引，在一次 target 前向中取得所有有效 logits；实现 GPU 最长接受前缀、有效输出长度及独立输出缓冲区。先验证 `[3,0,2]`、`[0,1,4]` 混批，覆盖拒绝后后续行恰好匹配但必须丢弃的情况。
-3. 已接入真实输出长度驱动的 CPU/GPU 长度提交、拒绝尾部隐藏、原 trial GDN 端点选择和异步完成事件；P3 优化端点存储与提交成本，保持 native 不重跑 target 的契约。
+固定参考路由与独立契约见 [后端适配](vllm_speculative_alignment.md)。
+EAGLE-3/P-EAGLE 需要 checkpoint 对应的层特征、词表映射、查询布局与缓存；
+P-EAGLE 需要并行训练权重。DFlash 家族需要独立 context/query KV、mask 与位置。
+DFlash2 selector、DSpark Markov head 的实际条件分布必须用于 q。
+每个后端均需真实权重、执行、恢复、验收与性能产物。
 
-P1/P2 同时对比“无投机逐词元路径”和“相同分块方式的主模型参考”，分别测试端点选择与跨路径数值等价程度。Near-tie、误差累积及非有限值单独记录。跨路径差异按已声明的数值/质量预算评估，不以 greedy 序列分歧直接判定算法错误；超预算时定位来源、修复或回退，不通过临时放宽阈值掩盖退化。
+## 7. 验收标准
 
-历史自然输入测试发现 packed 与普通 decode 有词元分歧，旧严格结果继续保留。当前不再以完全相同的词元序列作为 P2 交付门槛，改为数学语义、原 trial 端点选择、系统边界及数值/质量预算分别验收。`sequential` 和 `packed_guarded` 保留为参考及回退工具，native `packed` 用于真实多词元执行和性能评估。
+- **算法与系统：** 同 logits/概率的接受、补偿与 bonus 语义正确；预测行、
+  EOS/长度、历史/页引用、事务清理精确正确。K_i=0/1/4 混批不串请求。
+- **状态选择：** oracle 来自同一次原 trial；实际输出 m 个 token 时选零基端点
+  m-1，computed 推进 C+m，最后输出保持未计算；拒绝尾部不进入后续 draft 条件。
+- **数值：** 同输入同初始状态做 reset/rolling TV/KL、argmax 翻转、margin 和
+  层/状态偏差检查，运行前声明预算。当前诊断两边 LM head 逐行投影，生产 packed
+  head 另由自由生成与质量检查覆盖。未声明预算只报告诊断。
+- **质量：** 固定任务及评分，对照正确率和异常/重复/截断等退化；12 道算术题
+  仅为 smoke test，不能证明通用质量无损。
+- **性能：** 无 intrusive 状态探针，baseline 关闭 MTP feature 记录；报告配对
+  时间比、吞吐与整段耗时。不同输出的耗时比仅表示实际路径测量，不是同轨迹加速。
+  离线结果不标为服务 TTFT/P95 TPOT。
 
-## 8. 随机采样扩展原则
-
-常规线性投机采样在候选位置使用目标分布 p、草稿分布 q，接受概率为 `min(1, p(d)/q(d))`，拒绝后从归一化的 `max(p-q, 0)` 采样；全部接受时从目标末行分布采样额外词元。分布必须包含实际温度及届时已支持的采样处理。
-
-n-gram 的确定候选可视为点质量 q，而不是“没有草稿概率”。MTP/EAGLE/DFlash 后端必须提供与实际候选生成相符的分布契约；并行草稿是否适用同一线性拒绝公式需依据其联合/条件分布核实，不能机械套用。
-
-草稿、接受判定和目标采样使用独立的随机计数域，基于请求与逻辑位置定义。随机结果要求分布正确；不承诺与非投机路径同 seed 的样本逐词元相同。贪心与随机验收分别报告。
-
-## 9. MTP、EAGLE-3/P-EAGLE 与 DFlash/DFlash2/DSpark 的扩展边界
-
-MTP 需要匹配目标架构的预测头及训练权重。当前已加载本地 Qwen3.5-0.8B 的真实 MTP 权重，使用共享 embedding/head、独立 draft KV 和 target feature 历史；继续验证缓存同步、数值/质量预算及实际收益。
-
-EAGLE 家族需要兼容目标模型的训练草稿，使用的目标特征层、归一化位置和词表映射可能不同。目标模型提供可选的层级特征导出接口，按实际需要分配；没有模型草稿时，不额外保存全部隐藏层。
-
-P-EAGLE 使用对应并行训练的 EAGLE-3 checkpoint。固定 vLLM 路由为 `eagle3` 加 `parallel_drafting=True`，须适配并行 mask/位置与额外查询 slots，不能通过改变普通 EAGLE-3 的循环方式宣称支持。
-
-DFlash 使用目标隐藏状态条件下的块级并行草稿模型，草稿网络的计算和注意力布局与自回归主模型不同。它可以输出统一候选链供验证，但其模型执行不能伪装成 n-gram 或普通自回归循环。
-
-DFlash2 在固定 vLLM 中通过 `dflash` 方法加 `DFlash2DraftModel` 架构选择，额外包含局部动态卷积与 predecessor-conditioned top-K selector。DSpark 有独立 `dspark` 路由，增加 Markov head、可选 confidence 与 checkpoint 专属 anchor 布局。两者的实际条件草稿分布、缓存和预算必须分别实现，不能按普通 DFlash 的 unary logits 校正概率。
-
-未来每种方法的“支持”均需包括真实模型加载、草稿执行、拒绝恢复、验收脚本和性能记录。准备好接口只是架构准备，不是完成模型支持。
-
-## 10. 验证与测量计划
-
-算法与系统单测使用 `tests/test_spec_decode.py`、`test_spec_rejection.py`、`test_spec_state.py`、`test_spec_execution.py`、`test_spec_batch.py` 和 `test_spec_endpoints.py`。真实模型验收使用 `benchmarks/validate_spec_batch.py`、`validate_mtp.py`；共同输入的数值与 near-tie 诊断使用 `diagnose_target_numerics.py`；质量与性能分别使用 `validate_mtp_quality.py`、`bench_spec_decode.py`。入口、预算与结果字段见 [benchmark 验收指南](../benchmarks/README.md)。旧单请求验证及一次性 norm 操作数脚本已移除，历史结果保留在原评估记录中。
-
-预测行专项验收：使用各行不同的 mock logits 检查一位偏移；检验完整 hidden-state 索引与选中 logits 索引两个坐标系；变长 K_i=0/1/4 混批不得串请求；对每个接受长度 a 验证输出数 a+1、bonus 条件、占位过滤及 C+a+1 的状态端点。真实模型检查一次 packed 前向确实投影全部有效行，分别统计 native 验证与 guarded/资源回退的前向次数，native 部分接受不得重跑 target。
-
-新增 `tests/test_spec_batch.py` 与 `benchmarks/validate_spec_batch.py` 检查变长批次、CUDA 接受/提交、独立输出句柄及真实模型恢复端点。所有请求统一通过 `verify_speculative_batch` 验收，B=1 的全部接受长度和截断端点也由该路径覆盖。
-
-测试覆盖：n-gram 重叠/多匹配/短续段、候选全拒绝至全接受、预测行偏移、EOS 在候选和补偿词元内、剩余输出长度、上下文末尾、页边界前后、共享 prefix、状态池淘汰、资源不足、取消/抢占、异步输出所有权、非活动 slots 不变及异常事务清理。
-
-完整对照包括已确认 token、KV 有效区域、conv/recurrent state、CPU/GPU 已计算长度、页引用计数；禁止只检查最终文本。接受/输出长度、原 trial 端点、页引用及拒绝历史隔离要求精确正确。Prefix 对照记录实际命中与冷/热条件，状态保存/恢复相对于被保存的端点精确检查，跨执行路径的浮点结果按数值预算评估。小词表随机采样做分布统计验证，真实模型另做数值与生成质量验收。
-
-数值验收报告必须固定模型/权重、dtype、执行配置、输入与状态条件，包含共同输入的概率 TV/KL、argmax 翻转及 margin、层/状态偏差和 rolling 误差；自由生成另报客观任务质量、异常输出和重复/截断等退化。后续回归运行前声明适用范围、容差/质量预算和超预算处置，不能从一个小样本推导通用质量无损。MTP-1 的初步测量见评估记录，尚不作为所有 backend 的统一阈值。
-
-两类状态测试必须独立报告：
-
-- **State selection：** 固定原 packed trial 的端点，遍历接受与截断长度，验证正式状态精确等于被选中端点；KV/历史有效范围和未活动 slots 正确。未截断时接受 a 个候选，应选零基 `endpoint[a]`，即处理完 anchor 加 a 个候选后的状态；correction/bonus 是尚未计算的新 anchor。
-- **State numerical equivalence：** 从同一初始状态、同一输入分别运行 packed 与 single decode，测量 conv/recurrent/KV 和预测分布差异及跨 token 累积。这是数值控制测试，结果不要求 bit-for-bit；不能用 selection 通过代替数值/质量评估，也不能用浮点容差豁免选错端点。
-
-性能固定模型、硬件、精度、输入和输出长度及采样策略，对照当前非投机版本。场景包括重复文本/代码、普通对话、低匹配历史；batch=1/4/8/16，K=1/2/4/8，分别测量纯解码和后续集成的混合到达场景。
-
-记录输出 token 吞吐、整段生成耗时、逐轮耗时、草稿匹配率、候选接受率、每次验证输出数、草稿/验证/状态复制/重放/提交时间、峰值显存和回退次数。没有流式服务接口时不把离线指标标为服务 TTFT/P95 TPOT。预热与重复次数、模型/框架版本均写入 JSON；外部 vLLM 对照单独运行同条件配置，不预填性能目标或加速数字。
-
-## 11. 官方参考
-
-以下资料用于核对算法接口与扩展方向，本文方案基于 HybridInfer 的现有混合状态实现，不照搬 vLLM 的内部缓存布局。
-
-- [vLLM RejectionSampler 官方 API 与源码说明](https://docs.vllm.ai/en/latest/api/vllm/v1/sample/rejection_sampler/)（第 5 节实现结论以固定提交为准）
-- [vLLM 投机解码概览](https://docs.vllm.ai/en/stable/features/speculative_decoding/)
-- [n-gram 草稿](https://docs.vllm.ai/en/stable/features/speculative_decoding/n_gram/)
-- [MTP](https://docs.vllm.ai/en/stable/features/speculative_decoding/mtp/)
-- [EAGLE 草稿](https://docs.vllm.ai/en/stable/features/speculative_decoding/eagle/)
-- [投机配置与方法能力](https://docs.vllm.ai/en/stable/api/vllm/config/speculative/)
-- [DFlash 方法说明](https://docs.vllm.ai/projects/speculators/en/v0.7.0/user_guide/algorithms/dflash/)
-
-后续按上述三个验收维度补齐 P2 系统与质量覆盖，推进 P3 候选长度、批量 proposer 和图执行，并继续 P5 的 MTP 优化及 P6/P7 真实草稿适配；不再将跨路径 bit-for-bit 一致作为阶段推进条件。
+固定 vLLM 源码差分与安装版完整引擎对照分别声明版本及范围；token 相同率不替代
+算法、端点、数值预算或质量验收。入口与命令见 [验收指南](../benchmarks/README.md)。

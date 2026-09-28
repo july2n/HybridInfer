@@ -81,15 +81,20 @@ finally:
 - [GDN 内核与共享预填充实现](docs/gdn_kernel_optimization.md)
 - [投机解码实施计划](docs/speculative_decoding_plan.md)
 - [投机解码实现进度与验收边界](docs/speculative_decoding_progress.md)
-- [vLLM 对齐重测与 EAGLE-3/P-EAGLE/DFlash/DFlash2/DSpark/MTP 适配](docs/vllm_speculative_alignment.md)
+- [vLLM 参考与模型草稿适配契约](docs/vllm_speculative_alignment.md)
 - [模型数值验收记录](docs/qwen35_acceptance.md)
 
-## 后续计划
+## 投机解码进度与后续计划
 
-- [x] 单请求 n-gram 贪心投机解码执行链路（默认关闭；开启后保守验证，native packed 仍为实验选项）。
-- [x] 变长多请求 n-gram 贪心验证、GPU 接受/提交与异步输出句柄（native GDN 已按原验证端点在 GPU 恢复，完整系统验收见实施记录）。
-- [x] 共享随机拒绝采样与真实 Qwen3.5 MTP 初版（eager、关闭前缀缓存；完整严格生成门槛未通过）。
-- [ ] EAGLE-3/P-EAGLE、DFlash/DFlash2/DSpark 模型草稿。
+已实现变长批量 target 验证、原 trial GDN 端点选择、GPU 接受/提交、共享随机拒绝
+采样和真实 Qwen3.5 MTP。验收关注数学语义、端点正确与数值/质量预算；跨浮点
+路径的 greedy token 相同率作为诊断。投机默认关闭，开启后默认 `packed_guarded`。
+显式 `packed` 用于多词元执行。MTP 当前要求 eager、关闭 prefix cache。
 
-公共链路和 MTP 的实现、复测与限制见 [实施与验收](docs/speculative_mtp_implementation.md)。
-- [ ] 支持 MoE 模型。
+下一阶段建议补齐 MTP K=1/2/4、B1/B4 性能扫描与分项测量，建立普通 decode graph
+对照，再优化批量 proposer、图执行与候选长度选择。当前性能入口仅支持 B1，
+B4 和图路径对照需扩展入口；质量与系统覆盖伴随推进。
+EAGLE-3/P-EAGLE、DFlash/DFlash2/DSpark 和 MoE 尚未实现。
+
+实现与限制见 [公共链路与 MTP](docs/speculative_mtp_implementation.md)，
+测量见 [MTP 评估](docs/mtp1_evaluation.md)，任务顺序见 [实施计划](docs/speculative_decoding_plan.md)。

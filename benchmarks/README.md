@@ -24,7 +24,7 @@
 
 源码统一使用批量验证入口（B=1 也走同一路径）。Native 缺失原 trial 端点时
 报错并恢复事务；`sequential`/`packed_guarded` 提交普通单步 anchor。
-旧 conv 快照 kernel 已从生产源码移除，窗口 oracle 使用独立 Torch 公式。
+Conv 窗口 oracle 使用独立 Torch 公式。
 
 ## 常用命令
 
@@ -54,12 +54,14 @@ PYTHONPATH=src:.runtime-deps python benchmarks/bench_spec_decode.py \
 翻转率和自由生成首处分歧是不同指标。诊断脚本两边 LM head 都逐行投影，
 生产 packed head 的差异由自由生成/质量脚本另行覆盖。
 
-MTP 验证与数值诊断默认从本地模型及公共自然输入生成 fixtures，不依赖旧日志。
+MTP 验证与数值诊断默认从本地模型及公共自然输入生成 fixtures，不依赖已有日志。
 可显式传 `--vllm-baseline` 或 `--fixtures` 使用已有固定输入；
 `--check-vllm-forward` 可额外核对本地固定源码的 MTP 操作顺序。
 公共接受算法的固定 vLLM 源码对照仍依赖对应 checkout。
 
 性能仅计时，不运行 intrusive 端点/数值探针；baseline 不记录 MTP feature。
 输出不同仍提供 `measured_decode_time_ratio`，不能把它当成相同轨迹的加速证明。
-小样本质量 smoke 不能证明通用质量无损。历史 `*_token_passed` 结果与旧严格
-脚本产物不改写；旧单请求验证入口及历史 conv/BV/FMA/norm 替换已移除。
+小样本质量 smoke 不能证明通用质量无损。
+
+性能入口当前只支持 B1，MTP 要求 eager、关闭 prefix cache；B4 和普通 decode graph
+对照需扩展测量入口。下一步任务见 [实施计划](../docs/speculative_decoding_plan.md)。
