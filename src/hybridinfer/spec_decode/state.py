@@ -17,17 +17,19 @@ class GDNTransaction:
                 pool[self.trial_slot].copy_(original)
         return self
 
-    def commit(self, *, all_inputs_committed, replay):
-        if all_inputs_committed:
-            for pool, _ in self.original:
-                pool[self.source_slot].copy_(pool[self.trial_slot])
-        else:
-            replay()
+    def commit_trial(self):
+        """Commit the private state after an ordinary anchor fallback."""
+        for pool, _ in self.original:
+            pool[self.source_slot].copy_(pool[self.trial_slot])
+        self.committed = True
+
+    def finish_endpoint_commit(self):
+        """Mark original-trial endpoint selection complete; retain rollback on error."""
         self.committed = True
 
     def __exit__(self, exc_type, exc, tb):
         if exc_type is not None or not self.committed:
             for pool, original in self.original:
                 pool[self.source_slot].copy_(original)
-        # The single private slot is reused by the next synchronous transaction.
+        # Compute-stream ordering protects reuse of private trial slots.
         return False

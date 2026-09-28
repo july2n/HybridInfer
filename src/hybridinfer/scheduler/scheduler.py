@@ -41,38 +41,8 @@ class Scheduler:
             raise ValueError("prompt must fit within max_model_len and contain tokens")
         self.waiting.append(seq)
 
-    def begin_speculative(self):
-        """P1 reference: one ready decode request, no overlapping work."""
-        config = self.speculative
-        if not config or not config.enabled:
-            return None
-        def fallback(reason):
-            self.spec_fallbacks[reason] = self.spec_fallbacks.get(reason, 0) + 1
-            return None
-        if self.waiting or self.in_flight or len(self.running) != 1:
-            return fallback("batch_or_prefill")
-        seq = self.running[0]
-        if seq.temperature != 0:
-            return fallback("temperature")
-        from hybridinfer.spec_decode.interfaces import DraftContext, VerificationPlan
-        from hybridinfer.spec_decode.ngram import NgramProposer
-        context = DraftContext(seq.seq_id, tuple(seq.token_ids), seq.num_cached_tokens,
-                               seq.max_tokens - seq.num_completion_tokens,
-                               self.max_model_len, self.max_speculative_tokens)
-        proposal = (self.draft_proposer or NgramProposer(config)).propose([context])
-        candidates = proposal.tokens_for(0)
-        if not candidates:
-            return fallback("no_draft_or_budget")
-        plan = VerificationPlan(seq.seq_id, seq.num_cached_tokens, seq.last_token, candidates,
-                                proposal.probabilities)
-        if not self.block_manager.reserve_trial(seq, plan.trial_end):
-            return fallback("kv_capacity_or_shared_tail")
-        self.running.popleft()
-        self.in_flight.add(seq.seq_id)
-        return seq, plan
-
     def begin_speculative_batch(self):
-        """Reserve a greedy decode batch, including zero-draft anchor rows."""
+        """Reserve ready decode requests, including B=1 and zero-draft rows."""
         config = self.speculative
         if not config or not config.enabled:
             return None
@@ -121,11 +91,6 @@ class Scheduler:
             self.block_manager.trim_trial(seq, original*self.block_size)
             self.in_flight.discard(seq.seq_id)
             self.running.appendleft(seq)
-
-    def abort_speculative(self, seq):
-        self.block_manager.trim_trial(seq, seq.num_cached_tokens)
-        self.in_flight.discard(seq.seq_id)
-        self.running.appendleft(seq)
 
     def finish_speculative(self, seq, result):
         if seq.seq_id not in self.in_flight:

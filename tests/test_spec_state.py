@@ -19,35 +19,30 @@ class TransactionTests(unittest.TestCase):
             for pool in (layers[0].conv_states, layers[0].recurrent_states):
                 self.assertTrue(torch.equal(pool[0], pool[2]))
                 pool[2].add_(10)
-            txn.commit(all_inputs_committed=True, replay=lambda: self.fail('unexpected replay'))
+            txn.commit_trial()
         self.assertTrue(torch.equal(layers[0].recurrent_states[1], inactive))
         self.assertTrue(torch.equal(layers[0].recurrent_states[0], layers[0].recurrent_states[2]))
 
-    def test_partial_accept_replays_from_unchanged_source(self):
+    def test_selected_endpoint_is_preserved_on_commit(self):
         layers = self.pools()
         original = layers[0].recurrent_states[0].clone()
-        def replay():
-            self.assertTrue(torch.equal(layers[0].recurrent_states[0], original))
-            layers[0].recurrent_states[0].add_(3)
         with GDNTransaction(layers, 0, 2) as txn:
             layers[0].recurrent_states[2].add_(100)
-            txn.commit(all_inputs_committed=False, replay=replay)
+            layers[0].recurrent_states[0].copy_(original+3)
+            txn.finish_endpoint_commit()
         self.assertTrue(torch.equal(layers[0].recurrent_states[0], original+3))
 
-    def test_trial_and_replay_exceptions_restore_source(self):
-        for during_replay in (False, True):
+    def test_trial_and_commit_exceptions_restore_source(self):
+        for after_commit in (False, True):
             layers = self.pools()
             original = [x.clone() for x in (layers[0].conv_states[0], layers[0].recurrent_states[0])]
-            def fail():
-                layers[0].conv_states[0].add_(99)
-                layers[0].recurrent_states[0].add_(99)
-                raise RuntimeError('failed trial/replay')
             with self.assertRaises(RuntimeError):
                 with GDNTransaction(layers, 0, 2) as txn:
-                    if during_replay:
-                        txn.commit(all_inputs_committed=False, replay=fail)
-                    else:
-                        raise RuntimeError('trial')
+                    if after_commit:
+                        layers[0].conv_states[0].add_(99)
+                        layers[0].recurrent_states[0].add_(99)
+                        txn.finish_endpoint_commit()
+                    raise RuntimeError('trial/commit')
             for pool, saved in zip((layers[0].conv_states, layers[0].recurrent_states), original):
                 self.assertTrue(torch.equal(pool[0], saved))
 

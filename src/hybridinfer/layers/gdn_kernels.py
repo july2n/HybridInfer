@@ -109,34 +109,6 @@ def indexed_gdn_decode(q, k, v, a, b, a_log, bias, pool, slots):
 
 
 @triton.jit
-def _conv_endpoints(X, S, Slots, Cu, Snapshots, C: tl.constexpr,
-                    WIDTH: tl.constexpr, BC: tl.constexpr, BW: tl.constexpr):
-    req = tl.program_id(1)
-    slot = tl.load(Slots+req)
-    start, end = tl.load(Cu+req), tl.load(Cu+req+1)
-    c = tl.program_id(0)*BC+tl.arange(0, BC)
-    j = tl.arange(0, BW)
-    mask = (c[:, None] < C) & (j[None, :] < WIDTH)
-    for t in range(start, end):
-        pos = t-start+1-WIDTH+j
-        old = tl.load(S+(slot*C+c[:, None])*WIDTH+(pos[None, :]+WIDTH),
-                      mask & (pos[None, :] < 0), other=0)
-        new = tl.load(X+(start+pos[None, :])*C+c[:, None],
-                      mask & (pos[None, :] >= 0), other=0)
-        tl.store(Snapshots+(t*C+c[:, None])*WIDTH+j[None, :],
-                 tl.where(pos[None, :] >= 0, new, old), mask)
-
-
-def conv_endpoints(raw, pool, slots, cu_seqlens):
-    snapshots = torch.empty((raw.shape[0], *pool.shape[1:]), dtype=pool.dtype, device=pool.device)
-    channels, width = pool.shape[1:]
-    _conv_endpoints[(triton.cdiv(channels, 64), slots.numel())](
-        raw, pool, slots, cu_seqlens, snapshots, channels, width, 64,
-        triton.next_power_of_2(width))
-    return snapshots
-
-
-@triton.jit
 def _conv_history(X, Pool, Slots, Cu, History, C: tl.constexpr,
                   WIDTH: tl.constexpr, BC: tl.constexpr, BT: tl.constexpr):
     req = tl.program_id(2)
@@ -208,7 +180,7 @@ def compact_conv_endpoints(raw, pool, slots, cu_seqlens, max_len):
 @triton.jit
 def _packed_recurrent(Q, Kptr, Vptr, A, Bptr, Log, Bias, Pool, Slots, Cu, Out, Snapshots,
                       HQ: tl.constexpr, HV: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
-                      BK: tl.constexpr, BV: tl.constexpr, SAVE_STATES: tl.constexpr = True):
+                      BK: tl.constexpr, BV: tl.constexpr):
     batch, head = tl.program_id(0), tl.program_id(1)
     rows = tl.program_id(2)*BV+tl.arange(0, BV)
     cols = tl.arange(0, BK)
@@ -233,8 +205,7 @@ def _packed_recurrent(Q, Kptr, Vptr, A, Bptr, Log, Bias, Pool, Slots, Cu, Out, S
         v = tl.load(Vptr+(t*HV+head)*DV+rows, rows < DV, other=0).to(tl.float32)
         delta = (v-tl.sum(h*k[None, :], 1))*beta
         h = h+delta[:, None]*k[None, :]
-        if SAVE_STATES:
-            tl.store(Snapshots+((t*HV+head)*DV+rows[:, None])*DK+cols[None, :], h, mask)
+        tl.store(Snapshots+((t*HV+head)*DV+rows[:, None])*DK+cols[None, :], h, mask)
         y = tl.sum(h*q[None, :], 1)
         tl.store(Out+(t*HV+head)*DV+rows, y, rows < DV)
     tl.store(ptr, h, mask)

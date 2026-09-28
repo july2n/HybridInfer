@@ -156,12 +156,8 @@ class LLMEngine:
         more decode; new prefill work is still allowed to dispatch so
         late arrivals keep making progress.
         """
-        # Speculative transactions start only after queued batches drain.
-        # Single-request diagnostics keep their established reference hook.
-        if not self.batch_queue and (len(self.scheduler.running) > 1 or
-                (getattr(self.config, "speculative", None) and (self.config.speculative.method == "mtp" or
-                 (self.config.speculative.verification_mode == "packed" and
-                  any(s.temperature != 0 for s in self.scheduler.running))))):
+        # All speculative requests, including B=1, use one transaction path.
+        if not self.batch_queue:
             batch = self.scheduler.begin_speculative_batch()
             if batch is not None:
                 seqs, plans = batch
@@ -171,21 +167,6 @@ class LLMEngine:
                     self.scheduler.abort_speculative_batch(seqs)
                     raise
                 self.batch_queue.append((seqs, "spec_decode", 0, output))
-        if not self.batch_queue:
-            speculative = self.scheduler.begin_speculative()
-            if speculative is not None:
-                seq, plan = speculative
-                try:
-                    result = self.model_runner.call("verify_speculative", seq, plan)
-                except Exception:
-                    self.scheduler.abort_speculative(seq)
-                    raise
-                self.scheduler.finish_speculative(seq, result)
-                if result.finished:
-                    self.model_runner.call("remove_request", seq.seq_id)
-                    return [(seq.seq_id, seq.completion_token_ids)], -result.output_length
-                return [], -result.output_length
-
         # Phase 1: fill the queue (never blocks).
         while len(self.batch_queue) < self.max_concurrent_batches:
             decode_batches = [

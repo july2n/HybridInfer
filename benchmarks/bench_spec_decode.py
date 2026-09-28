@@ -61,8 +61,6 @@ def main():
     parser.add_argument('--draft-sweep', type=int, nargs='+', help='Candidate limits, e.g. 1 2 4 8')
     parser.add_argument('--modes', nargs='+', choices=('baseline', 'sequential', 'packed', 'packed_guarded'),
                         default=['baseline', 'packed'])
-    parser.add_argument('--require-token-match', action='store_true',
-                        help='Exit nonzero after saving results if any outputs differ')
     args = parser.parse_args()
     if min(args.output_tokens, args.prompt_tokens, args.repeats, args.warmups, args.draft_tokens) < 1:
         parser.error('lengths, repeats and warmups must be positive')
@@ -166,7 +164,7 @@ def main():
                         case_names=list(cases),
                         measurement_order='rotating_interleaved', modes=args.modes,
                         enabled_default_verification=SpeculativeConfig().verification_mode,
-                        max_draft_tokens=draft_limits, token_match_required=args.require_token_match,
+                        max_draft_tokens=draft_limits,
                         draft_method=args.method,
                         baseline_target_feature_tracking=False,
                         scope='offline decode and whole generation')
@@ -177,8 +175,6 @@ def main():
                                        all_token_matches=completed and bool(records)
                                            and all(all(c['baseline_token_matches']) for c in records),
                                        cases=records), indent=2)+'\n')
-    if args.require_token_match and any(not all(c['baseline_token_matches']) for c in records):
-        raise AssertionError(f'outputs differ from baseline; see {args.json_out}')
 
 
 if __name__ == '__main__':

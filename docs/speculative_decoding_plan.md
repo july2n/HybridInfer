@@ -1,20 +1,28 @@
 # 投机解码实施计划
 
-**2026-09-28 验收调整（用户确认）：** 不再把完整 vLLM/普通 target 的逐位数值或
-greedy 序列一致性作为后续 backend 推进的硬门槛。状态选择、已提交历史、
-KV 有效范围、随机拒绝采样逻辑仍须正确；数值路径通过共同输入的概率偏差、
-argmax 翻转、客观任务质量及性能共同评估。先完成单候选 MTP（mtp-1）评估，
-可接受后推进后续适配。旧严格结果保留，不将失败记录改写为通过。
+**当前目标（2026-09-28，用户确认）：数学语义一致 + 正确选择 speculative endpoint + 控制数值误差。**
+不强制 `packed verification == single decode bit-for-bit`，也不要求不同浮点
+执行路径的 greedy 自由生成序列完全相同。接受/拒绝算法、因果性、历史有效
+范围及状态提交仍须正确；浮点差异按概率偏差、翻转、任务质量和性能评估。
+旧逐位对照结果保留为诊断证据，不改写历史失败，也不作为后续 backend 的硬门槛。
 
 **2026-09-28 目标更新：最终适配 EAGLE-3、P-EAGLE、DFlash、DFlash2、DSpark、MTP；n-gram 仅作为公共链路测试后端。** 新的固定 vLLM 新旧 runner 对齐检查、六种方法的独立特征/缓存/分布契约及实施顺序见 [vLLM 对齐审计](vllm_speculative_alignment.md)。后续按“公共 target recurrent 验证与状态选择 → 设备草稿/特征接口与拒绝 sampler → 本地真实 MTP → EAGLE-3/P-EAGLE → DFlash/DFlash2/DSpark”推进；不继续以 n-gram 性能优化作为最终交付。
 
-**最新实施：** 公共 recurrent target、原 trial 端点选择、设备特征/草稿接口、共享随机拒绝及真实 MTP 已接入；完整严格生成门槛尚未通过。详见 [本次实施与验收](speculative_mtp_implementation.md)。以下保留原阶段计划作为验收背景。
+**最新实施：** 公共 recurrent target、原 trial 端点选择、共享随机拒绝及真实 MTP 已接入；conv 已采用共享扩展历史。MTP-1 完成状态、数值、质量 smoke test 和性能评估，已推进 K=2/4 扫描，详见 [MTP-1 评估](mtp1_evaluation.md)。完整系统与质量推广验收仍需补齐。
 
-本文定义实施范围和验收门槛；实际交付与验证结果见[实施记录](speculative_decoding_progress.md)。目前 P0 与单请求 n-gram 贪心执行链路已实现，正常 packed 路径的扩展词元一致性验收仍未通过，P2 已接入首版变长批量执行、GPU 接受/提交与异步输出句柄，完整系统验收仍在补齐。第一阶段以 n-gram 草稿和贪心验证建立可验证的执行链路，最终支持 MTP、EAGLE/EAGLE3、DFlash 等草稿方法。默认关闭，关闭后保留现有执行行为。
+本文定义当前实施范围和验收门槛；[实施记录](speculative_decoding_progress.md)中的旧逐位门槛与结果保留为历史。最终支持六种模型草稿方法，n-gram 用于公共链路测试。投机功能默认关闭，开启后默认仍为 `packed_guarded`；默认配置调整须依据实际质量与收益评估。
 
 ## 1. 目标与范围
 
 建立“生成草稿 → 主模型批量验证 → 接受/拒绝 → 状态提交”的通用机制。草稿方法可以替换，主模型验证、历史状态管理、调度和输出协议保持共用。
+
+目标分为三个独立验收维度：
+
+1. **数学语义一致。** Target 使用正确的因果历史与预测行；贪心接受连续匹配前缀，随机接受与补偿使用实际 p/q；token/feature shift、EOS、长度截断和 bonus 语义正确。同一组 logits/概率的算法对照应一致，不以容差豁免索引或采样错误。
+2. **正确选择 speculative endpoint。** 在原 packed trial 中保留可恢复端点，按实际接受/输出长度提交 conv、recurrent、KV 有效长度及 CPU/GPU 历史。正式状态必须精确对应被选中的原 trial 端点，不能提交拒绝尾部。正常 native 路径只做 endpoint commit，不重跑 target。
+3. **控制数值误差。** 在相同输入、相同初始状态下测量 packed 与 single decode 的 logits、概率及状态偏差；结合 rolling 累积、near-tie 翻转、自由生成质量和性能判断是否可接受。跨执行路径不强制逐位或逐 token 相同。
+
+逐位比较用于定位误差和防止局部回归；它只在相同执行路径的端点复制、索引及明确声明的 kernel 契约中作为硬检查。
 
 第一版范围：Qwen3.5 Dense、单 GPU、线性候选链、temperature=0、CPU n-gram 查找、普通执行路径。无匹配、预算不足或资源不足时回退到单词元解码。初始正确性阶段不混合预填充与投机验证，不捕获新的完整验证图。
 
@@ -137,17 +145,28 @@ vLLM 输出缓冲区为 `[B,max(K_i)+1]`，未输出部分填占位 token。本�
 
 EOS、`max_tokens` 或上下文边界可截断输出，必须按截断后的实际输出数重新确定状态端点，不能提交未输出尾部。若终止路径采用不同的最终锚点处理，应显式记录最终实际计算量，并单独验收。
 
-单请求与变长批次的 `packed` 已采用一次 `[u,d1,...,dK]` 因果前向和全部 K+1 行投影；`sequential` 是逐词元正确性参考；`packed_guarded` 额外执行逐词元路径并比较预测/KV/GDN，属于本项目针对已发现数值分歧的保守措施。多请求的逐个 batch=1 参考已复现长输出分歧，因此批量 `sequential`/`packed_guarded` 当前使用普通 batch 形状的锚点参考，只提交一步目标输出，不计草稿接受；不同于单请求 K+1 行逐词元复核。上述 vLLM 正常验证链路没有逐候选重跑 target 来复核 packed logits。后续加速路径应以一次 packed 验证为目标；不能把 guarded 的复核成本计为 vLLM 式正常验证成本，也不能仅凭参考 vLLM 就移除现有正确性门槛。
+所有请求（包括 B=1）统一通过 `verify_speculative_batch` 执行。Native `packed` 对
+`[u,d1,...,dK]` 做一次因果前向并投影全部有效预测行，提交原 trial 的接受端点。
+`sequential` 直接执行普通 batch 形状的单步 anchor；`packed_guarded` 先做 packed
+诊断，再提交普通单步 anchor，接受候选数为零。两者均为参考/回退路径，不将
+其额外开销计入正常 native 验证成本。
 
 ## 6. GDN 与 KV 的事务式提交
 
-### 6.1 首版正确性策略：私有状态试算与重放
+### 6.1 当前策略：私有状态试算与原 trial 端点提交
 
-不占用用于公共 prefix caching 的快照池。为每个活动验证请求准备私有临时 GDN slot，将当前卷积和 recurrent state 复制进去，用临时 slot 完成候选验证，正式 GDN 状态保持不变。
+验证开始时，每个请求的正式 conv/recurrent 状态复制到私有 trial slot；保存原状态
+用于异常恢复。Packed scan 保存每个 recurrent 端点，conv 保存初始历史和原始
+trial token 的共享扩展历史。正式状态在接受判定前不推进。
 
-全部接受且无截断时，将临时最终状态复制回正式 slot。部分接受时，从保持不变的正式状态重放 `[u, d1, ..., da]`，仅更新正式状态，不进行第二次采样；主模型补偿词元仍保持未计算。发生截断时按截断后的端点提交/重放。
+接受或截断后，GPU 按实际输出长度选择原 trial 端点，提交 conv 窗口和 recurrent
+状态，再提交正式 token 与 computed length。Correction/bonus 保持未计算，作为
+下轮 anchor。Native 不重跑 target；端点缺失视为实现错误，恢复事务并报错。
+显式资源不足回退则重置私有状态，执行普通单步 anchor，并复制该端点回正式 slot。
 
-这个方案避免逆推 GDN，但状态复制和重放有明显开销。必须报告开销，不能因为减少验证轮数就宣称加速。草稿仍为 CPU n-gram。单请求保留同步参考入口；多请求已在 GPU 求接受端点和提交正式 token/长度，输出通过独立句柄异步拷回。显式 packed 的部分接受恢复需要取回长度来构造 GDN 重放输入，因此尚不是全程无同步的 GPU 流水线；批量保守模式只提交锚点参考的状态，无需部分接受重放。
+事务接口区分 `commit_trial()`（普通 anchor 状态复制）与
+`finish_endpoint_commit()`（端点选择完成）。异常仍恢复原正式状态。状态复制、
+选择及提交成本分别测量，不能仅凭减少验证轮数宣称加速。
 
 ### 6.2 KV 管理
 
@@ -161,14 +180,16 @@ EOS、`max_tokens` 或上下文边界可截断输出，必须按截断后的实�
 
 vLLM 的混合状态路径也需要按接受端点选择 recurrent state，不能仅回退 KV 长度。例如固定版本的 [`mamba_utils` 状态迁移](https://github.com/vllm-project/vllm/blob/a4eb3f25d6f9b3cad7ecf5390423d853935fcaeb/vllm/v1/worker/mamba_utils.py#L519) 使用 `num_accepted_tokens-1` 的状态偏移；该字段的计数口径必须结合调用方核对，不能直接等同于本项目的草稿接受数 a。可借鉴“保留逐位置状态、按端点选择”的机制，但不能直接套用其 block 布局或索引。
 
-对短候选链评估在 GDN 内核中保存逐位置状态，只恢复接受端点；或者保留分段检查点并有限重放。先核算每请求 `层数 × 头数 × V × K × 4 字节 × 保存端点数`，避免快照显存吞掉收益。不能用 prefix 快照池代替临时验证状态池。
+当前 native 路径已保存原 trial 的每个 recurrent 端点，conv 使用共享扩展历史。
+接受后只提交选中的端点，不重跑 target。后续优化存储和选择成本时必须保持该契约；
+资源不足可在验证事务外显式回退普通解码。核算每请求 `层数 × 头数 × V × K × 4 字节 × 保存端点数`，避免快照显存吞掉收益。不能用 prefix 快照池代替临时验证状态池。
 
 ## 7. 实施阶段与验收门槛
 
 | 阶段 | 交付内容 | 完成标准 |
 |---|---|---|
 | P0：基础契约 | 配置、公共数据结构、长度/预测行定义、状态事务与确定性参考验证器 | mock logits 覆盖所有接受长度；默认关闭无行为变化 |
-| P1：n-gram 贪心闭环 | CPU 草稿、单请求普通执行、私有 GDN 试算、部分接受重放、多词元输出 | 无匹配、全接受、首位/中间拒绝、EOS、长度截断均正确；不会发布拒绝历史 |
+| P1：n-gram 贪心闭环 | CPU 草稿、B=1 公共验证入口、私有 GDN 试算、原端点选择、多词元输出 | 无匹配、全接受、首位/中间拒绝、EOS、长度截断均正确；不会发布拒绝历史 |
 | P2：批量与系统集成 | 一次 target 因果前向、两层预测行索引、变长 K_i 元数据、GPU 接受/输出/提交、异步输出、资源不足回退 | K_i=0/1/4 混批的行映射与有效长度正确；slot 重排、跨页、并发、抢占重算、prefix 开关均通过状态对照 |
 | P3：性能优化 | 逐位置状态/分段恢复、自适应 K、按接受收益回退、分段图验证 | 分项测量证明收益来源；低命中负载不持续承担无效验证成本 |
 | P4：随机投机采样 | 草稿分布协议、拒绝采样、补偿分布、位置稳定随机计数 | 小词表统计验证主模型目标分布；拒绝后随机计数不受未提交候选污染 |
@@ -182,11 +203,11 @@ P2 首版已按以下顺序接入，完整系统验收与 P3 优化继续按此�
 
 1. 已将第 5 节的行映射、首位/中间拒绝、全接受 bonus 和端点关系作为显式契约，核对当前 packed 实现；区分预测行错误与 packed/decode 数值差异。
 2. P2 已建立变长 K_i 的打包输入和两层索引，在一次 target 前向中取得所有有效 logits；实现 GPU 最长接受前缀、有效输出长度及独立输出缓冲区。先验证 `[3,0,2]`、`[0,1,4]` 混批，覆盖拒绝后后续行恰好匹配但必须丢弃的情况。
-3. 已接入真实输出长度驱动的 CPU/GPU 长度提交、拒绝尾部隐藏、GDN 恢复和异步完成事件；在正确性门槛通过后，P3 评估逐位置 GDN 状态替代部分接受重放，避免另一次采样或不必要的模型复核。
+3. 已接入真实输出长度驱动的 CPU/GPU 长度提交、拒绝尾部隐藏、原 trial GDN 端点选择和异步完成事件；P3 优化端点存储与提交成本，保持 native 不重跑 target 的契约。
 
-现有 prefill 扫描与 decode 递推可能存在 BF16 数值差异。P1/P2 要同时对比“无投机逐词元路径”和“相同分块方式的主模型参考”。已知 near-tie 单独记录；若批量验证导致无法满足已定义的精度/词元验收，不通过提高容差解决，使用保守回退或先修复差异。严格逐 token 一致不能仅从算法等价推出。
+P1/P2 同时对比“无投机逐词元路径”和“相同分块方式的主模型参考”，分别测试端点选择与跨路径数值等价程度。Near-tie、误差累积及非有限值单独记录。跨路径差异按已声明的数值/质量预算评估，不以 greedy 序列分歧直接判定算法错误；超预算时定位来源、修复或回退，不通过临时放宽阈值掩盖退化。
 
-2026-09-28 扩展自然输入验收发现正常 packed 在中文、仓库实际代码和低匹配文本上出现真实词元分歧。因此同分块状态验收通过不能替代普通解码词元验收。开启后的默认模式已改为保守 `packed_guarded`；`sequential` 提供直接参考路径，`packed` 保留为显式实验选项。P2 的交付验收保留上述门槛，不能把这些分歧作为成功样例。
+历史自然输入测试发现 packed 与普通 decode 有词元分歧，旧严格结果继续保留。当前不再以完全相同的词元序列作为 P2 交付门槛，改为数学语义、原 trial 端点选择、系统边界及数值/质量预算分别验收。`sequential` 和 `packed_guarded` 保留为参考及回退工具，native `packed` 用于真实多词元执行和性能评估。
 
 ## 8. 随机采样扩展原则
 
@@ -198,7 +219,7 @@ n-gram 的确定候选可视为点质量 q，而不是“没有草稿概率”�
 
 ## 9. MTP、EAGLE-3/P-EAGLE 与 DFlash/DFlash2/DSpark 的扩展边界
 
-MTP 需要匹配目标架构的预测头及训练权重。当前加载器跳过 MTP 参数，必须显式注册并验证加载完整性；2026-09-28 已检查本地 Qwen3.5-0.8B safetensors，确认具有 15 个真实 MTP 张量，约 39.01 MiB，但尚未接入本引擎执行。
+MTP 需要匹配目标架构的预测头及训练权重。当前已加载本地 Qwen3.5-0.8B 的真实 MTP 权重，使用共享 embedding/head、独立 draft KV 和 target feature 历史；继续验证缓存同步、数值/质量预算及实际收益。
 
 EAGLE 家族需要兼容目标模型的训练草稿，使用的目标特征层、归一化位置和词表映射可能不同。目标模型提供可选的层级特征导出接口，按实际需要分配；没有模型草稿时，不额外保存全部隐藏层。
 
@@ -212,15 +233,22 @@ DFlash2 在固定 vLLM 中通过 `dflash` 方法加 `DFlash2DraftModel` 架构�
 
 ## 10. 验证与测量计划
 
-已提供 `tests/test_spec_decode.py`、`tests/test_spec_state.py`、`tests/test_spec_execution.py`、`benchmarks/validate_spec_decode.py` 和 `benchmarks/bench_spec_decode.py`。扩展自然输入与 near-tie 诊断使用 `benchmarks/validate_spec_natural.py`，诊断回归使用 `tests/test_spec_diagnostics.py`。
+算法与系统单测使用 `tests/test_spec_decode.py`、`test_spec_rejection.py`、`test_spec_state.py`、`test_spec_execution.py`、`test_spec_batch.py` 和 `test_spec_endpoints.py`。真实模型验收使用 `benchmarks/validate_spec_batch.py`、`validate_mtp.py`；共同输入的数值与 near-tie 诊断使用 `diagnose_target_numerics.py`；质量与性能分别使用 `validate_mtp_quality.py`、`bench_spec_decode.py`。入口、预算与结果字段见 [benchmark 验收指南](../benchmarks/README.md)。旧单请求验证及一次性 norm 操作数脚本已移除，历史结果保留在原评估记录中。
 
-预测行专项验收：使用各行不同的 mock logits 检查一位偏移；检验完整 hidden-state 索引与选中 logits 索引两个坐标系；变长 K_i=0/1/4 混批不得串请求；对每个接受长度 a 验证输出数 a+1、bonus 条件、占位过滤及 C+a+1 的状态端点。真实模型检查一次 packed 前向确实投影全部有效行，分别统计正常验证、guarded 复核和部分接受状态重放的前向次数。
+预测行专项验收：使用各行不同的 mock logits 检查一位偏移；检验完整 hidden-state 索引与选中 logits 索引两个坐标系；变长 K_i=0/1/4 混批不得串请求；对每个接受长度 a 验证输出数 a+1、bonus 条件、占位过滤及 C+a+1 的状态端点。真实模型检查一次 packed 前向确实投影全部有效行，分别统计 native 验证与 guarded/资源回退的前向次数，native 部分接受不得重跑 target。
 
-新增 `tests/test_spec_batch.py` 与 `benchmarks/validate_spec_batch.py` 检查变长批次、CUDA 接受/提交、独立输出句柄及真实模型恢复端点。单请求入口仍保留原诊断钩子，批量路径通过 `verify_speculative_batch` 独立验收。
+新增 `tests/test_spec_batch.py` 与 `benchmarks/validate_spec_batch.py` 检查变长批次、CUDA 接受/提交、独立输出句柄及真实模型恢复端点。所有请求统一通过 `verify_speculative_batch` 验收，B=1 的全部接受长度和截断端点也由该路径覆盖。
 
 测试覆盖：n-gram 重叠/多匹配/短续段、候选全拒绝至全接受、预测行偏移、EOS 在候选和补偿词元内、剩余输出长度、上下文末尾、页边界前后、共享 prefix、状态池淘汰、资源不足、取消/抢占、异步输出所有权、非活动 slots 不变及异常事务清理。
 
-完整对照包括已确认 token、KV 有效区域、conv/recurrent state、CPU/GPU 已计算长度、页引用计数；禁止只检查最终文本。prefix 对照须记录双方实际命中与冷/热条件：普通解码自身的冷/热数值差异单独报告，相同缓存条件下的词元与状态仍要求精确一致，不通过扩大容差豁免。小词表随机采样做概率统计验证，真实模型另做数值与生成验收。
+完整对照包括已确认 token、KV 有效区域、conv/recurrent state、CPU/GPU 已计算长度、页引用计数；禁止只检查最终文本。接受/输出长度、原 trial 端点、页引用及拒绝历史隔离要求精确正确。Prefix 对照记录实际命中与冷/热条件，状态保存/恢复相对于被保存的端点精确检查，跨执行路径的浮点结果按数值预算评估。小词表随机采样做分布统计验证，真实模型另做数值与生成质量验收。
+
+数值验收报告必须固定模型/权重、dtype、执行配置、输入与状态条件，包含共同输入的概率 TV/KL、argmax 翻转及 margin、层/状态偏差和 rolling 误差；自由生成另报客观任务质量、异常输出和重复/截断等退化。后续回归运行前声明适用范围、容差/质量预算和超预算处置，不能从一个小样本推导通用质量无损。MTP-1 的初步测量见评估记录，尚不作为所有 backend 的统一阈值。
+
+两类状态测试必须独立报告：
+
+- **State selection：** 固定原 packed trial 的端点，遍历接受与截断长度，验证正式状态精确等于被选中端点；KV/历史有效范围和未活动 slots 正确。未截断时接受 a 个候选，应选零基 `endpoint[a]`，即处理完 anchor 加 a 个候选后的状态；correction/bonus 是尚未计算的新 anchor。
+- **State numerical equivalence：** 从同一初始状态、同一输入分别运行 packed 与 single decode，测量 conv/recurrent/KV 和预测分布差异及跨 token 累积。这是数值控制测试，结果不要求 bit-for-bit；不能用 selection 通过代替数值/质量评估，也不能用浮点容差豁免选错端点。
 
 性能固定模型、硬件、精度、输入和输出长度及采样策略，对照当前非投机版本。场景包括重复文本/代码、普通对话、低匹配历史；batch=1/4/8/16，K=1/2/4/8，分别测量纯解码和后续集成的混合到达场景。
 
@@ -238,4 +266,4 @@ DFlash2 在固定 vLLM 中通过 `dflash` 方法加 `DFlash2DraftModel` 架构�
 - [投机配置与方法能力](https://docs.vllm.ai/en/stable/api/vllm/config/speculative/)
 - [DFlash 方法说明](https://docs.vllm.ai/projects/speculators/en/v0.7.0/user_guide/algorithms/dflash/)
 
-P0–P1 与 P2 首版执行链路已接入；后续补齐 P2 系统验收，再依据正确性和状态恢复成本推进 P3；MTP/EAGLE/DFlash 保留公共接口与明确依赖，不在首轮创建未验证的模型实现。
+后续按上述三个验收维度补齐 P2 系统与质量覆盖，推进 P3 候选长度、批量 proposer 和图执行，并继续 P5 的 MTP 优化及 P6/P7 真实草稿适配；不再将跨路径 bit-for-bit 一致作为阶段推进条件。

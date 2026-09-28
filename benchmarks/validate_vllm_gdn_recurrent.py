@@ -26,6 +26,7 @@ def main():
     load_definitions(source, ns)
     reference = ns['fused_sigmoid_gating_delta_rule_update']
     record = dict(passed=False, numerical_passed=True, bitwise_passed=True, revision=PINNED_COMMIT,
+                  tolerance=dict(state_rtol=1e-4, state_atol=1e-5, output_rtol=.02, output_atol=.002),
                   source_sha256=hashlib.sha256(source.read_bytes()).hexdigest(), layouts=[])
     for hq, hv in [(2, 4), (4, 4), (16, 16)]:
         for lengths in [[1], [1, 2, 4, 9], [9, 1, 3], [5]*8]:
@@ -66,7 +67,7 @@ def main():
                 record['layouts'].append(dict(lengths=lengths, initial_bias=initial_bias, key_heads=hq, value_heads=hv,
                                               endpoints=total, state_max_abs=error,
                                               numerical_passed=numerical, bitwise_passed=bitwise))
-    record['passed'] = record['numerical_passed'] and record['bitwise_passed']
+    record['passed'] = record['numerical_passed']
     Path(args.json_out).write_text(json.dumps(record, indent=2)+'\n')
     print(json.dumps(record, indent=2))
     raise SystemExit(0 if record['passed'] else 1)

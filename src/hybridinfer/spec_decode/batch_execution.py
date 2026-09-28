@@ -244,37 +244,17 @@ def verify_speculative_batch(runner, seqs, plans):
                     remaining_output_tokens=[s.max_tokens-s.num_completion_tokens for s in seqs],
                     max_model_len=runner.config.max_model_len, eos=runner.config.eos,
                     ignore_eos=[s.ignore_eos for s in seqs])
-            partial_seqs, partial_plans, partial_slots = [], [], []
             if anchor_only:
-                # This is an ordinary target fallback, with zero accepted
-                # drafts and one correction output even if it equals d1.
-                # The private anchor state is already the committed endpoint.
                 for txn in transactions:
-                    txn.commit(all_inputs_committed=True, replay=None)
+                    txn.commit_trial()
             else:
                 endpoints = getattr(runner, '_trial_endpoints', {})
-                if len(endpoints) == len(runner.gdn_layers):
-                    starts = torch.tensor([0, *batch.scheduled_counts[:-1]], device=device).cumsum(0)
-                    select_endpoints(endpoints, slots_t, starts + acceptance.lengths - 1)
-                    for txn in transactions:
-                        txn.commit(all_inputs_committed=False, replay=lambda: None)
-                else:
-                    # Native GDN recovery still needs one length transfer.
-                    counts = acceptance.lengths.cpu().tolist()
-                    for seq, plan, src, txn, count in zip(seqs, plans, slots, transactions, counts):
-                        if count == len(plan.input_tokens):
-                            txn.commit(all_inputs_committed=True, replay=None)
-                        else:
-                            partial_seqs.append(seq)
-                            partial_plans.append(VerificationPlan(plan.request_id, plan.computed_length,
-                                                                  plan.anchor, plan.candidates[:count-1]))
-                            partial_slots.append(src)
-                    if partial_plans:
-                        packed_batch_forward(runner, partial_seqs, VerificationBatch.from_plans(partial_plans),
-                                             partial_slots, project=False)
-                        for txn, count, plan in zip(transactions, counts, plans):
-                            if count < len(plan.input_tokens):
-                                txn.commit(all_inputs_committed=False, replay=lambda: None)
+                if set(endpoints) != {layer.layer_idx for layer in runner.gdn_layers}:
+                    raise RuntimeError('native verification is missing original GDN endpoints')
+                starts = torch.tensor([0, *batch.scheduled_counts[:-1]], device=device).cumsum(0)
+                select_endpoints(endpoints, slots_t, starts+acceptance.lengths-1)
+                for txn in transactions:
+                    txn.finish_endpoint_commit()
             committed = clock()
             commit_batch(state, runner.sampled_token_ids_gpu, slots_t, acceptance)
             done = clock()
@@ -290,7 +270,7 @@ def verify_speculative_batch(runner, seqs, plans):
                     ('accepted_tokens', sum(r.accepted_draft_tokens for r in results)),
                     ('output_tokens', sum(r.output_length for r in results)),
                     ('trial_tokens', sum(r.trial_computed_tokens for r in results)),
-                    ('replay_tokens', sum(len(p.input_tokens) for p in partial_plans)),
+                    ('replay_tokens', 0),
                     ('copy_seconds', elapsed(start, copied)), ('verify_seconds', elapsed(copied, verified)),
                     ('restore_seconds', elapsed(verified, committed)), ('commit_seconds', elapsed(committed, done))):
                     stats[key] = stats.get(key, 0)+value

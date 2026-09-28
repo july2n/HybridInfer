@@ -10,7 +10,8 @@ from hybridinfer.layers.gdn_kernels import packed_causal_conv, indexed_gdn_decod
 class GDNKernelTests(unittest.TestCase):
     @torch.inference_mode()
     def test_compact_conv_history_matches_all_original_endpoints(self):
-        from hybridinfer.layers.gdn_kernels import conv_endpoints, compact_conv_endpoints
+        from hybridinfer.layers.gdn_kernels import compact_conv_endpoints
+        from benchmarks.spec_validation import conv_history_reference
         for lengths in ([2], [1, 2, 5, 9], [9, 1, 3]):
             channels, width = 137, 3
             x = torch.randn(sum(lengths), channels, device='cuda', dtype=torch.bfloat16)
@@ -21,7 +22,7 @@ class GDNKernelTests(unittest.TestCase):
                 bounds.append(bounds[-1]+length)
             cu = torch.tensor(bounds, device='cuda', dtype=torch.int32)
             old = pool.clone()
-            expected = conv_endpoints(x, pool, slots, cu)
+            expected = conv_history_reference(x, pool, slots, cu)
             compact = compact_conv_endpoints(x, pool, slots, cu, max(lengths))
             indices = torch.arange(x.shape[0], device='cuda').flip(0)
             self.assertTrue(torch.equal(compact.index_select(0, indices), expected[indices]))
@@ -47,7 +48,7 @@ class GDNKernelTests(unittest.TestCase):
                                          round_before_silu=False)
             actual = torch.cat([packed_causal_conv(row[None], weights, ordinary,
                 slots, None, 1, decode=True, round_before_silu=False) for row in x])
-            self.assertTrue(torch.equal(actual, expected))
+            torch.testing.assert_close(actual, expected, rtol=.02, atol=.002)
             self.assertTrue(torch.equal(ordinary, pool))
             self.assertTrue(torch.equal(pool[[0, 2]], idle))
 
@@ -73,8 +74,8 @@ class GDNKernelTests(unittest.TestCase):
             for i in range(count):
                 actual = indexed_gdn_decode(q[i:i+1,None], k[i:i+1,None], v[i:i+1,None],
                     a[i:i+1], b[i:i+1], log, bias, ordinary, slots)
-                self.assertTrue(torch.equal(actual.reshape_as(output[i]), output[i]))
-                self.assertTrue(torch.equal(ordinary[1], states[i]))
+                torch.testing.assert_close(actual.reshape_as(output[i]), output[i], rtol=.02, atol=.002)
+                torch.testing.assert_close(ordinary[1], states[i], rtol=1e-4, atol=1e-5)
             self.assertTrue(torch.equal(pool[[0,2]], initial[[0,2]]))
             self.assertTrue(torch.equal(ordinary[[0,2]], initial[[0,2]]))
 

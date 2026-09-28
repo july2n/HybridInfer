@@ -371,10 +371,6 @@ class ModelRunner:
         # Ordinary decode dispatches through the graph manager.
         return self.cuda_graphs.run_decode(input_ids, positions)
 
-    def verify_speculative(self, seq, plan):
-        from hybridinfer.spec_decode.execution import verify_speculative
-        return verify_speculative(self, seq, plan)
-
     def verify_speculative_batch(self, seqs, plans):
         from hybridinfer.spec_decode.batch_execution import verify_speculative_batch
         return verify_speculative_batch(self, seqs, plans)

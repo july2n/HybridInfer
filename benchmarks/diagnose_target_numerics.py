@@ -7,21 +7,18 @@ import argparse
 from contextlib import contextmanager
 import hashlib
 import json
-import re
+import math
 from pathlib import Path
 
 import torch
-import triton
+from spec_validation import numerical_summary
 from hybridinfer.engine.llm_engine import LLMEngine
-from hybridinfer.layers import gated_delta_net as gdn
-from hybridinfer.layers import gdn_kernels as kernels
 from hybridinfer.layers.attention import Attention, store_kvcache, flash_attn_with_kvcache
 from hybridinfer.layers.linear import LinearBase
-from hybridinfer.layers.layernorm import GemmaRMSNorm, RMSNormGated
-from hybridinfer.layers.activation import SiluAndMul
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.spec_decode import SpeculativeConfig
-from hybridinfer.spec_decode.execution import packed_forward
+from hybridinfer.spec_decode.batch_execution import packed_batch_forward
+from hybridinfer.spec_decode.metadata import VerificationBatch
 from hybridinfer.spec_decode.interfaces import VerificationPlan
 from hybridinfer.utils.context import BatchDescriptor, get_context, reset_context, set_context
 
@@ -36,35 +33,11 @@ def difference(reference, candidate):
 
 
 @contextmanager
-def intervention(model, name, norm_audit=None):
-    """Restore overrides on failure; conv/BV/FMA retain historical interventions.
-
-    Those historical controls select the pre-alignment ordinary arithmetic,
-    rather than the current shared decode/verification arithmetic.
-    """
+def intervention(model, name):
+    """Optional source-localization controls; never change production operators."""
     flags = set(name.split('+'))
-    old_conv, old_rec = gdn.packed_causal_conv, gdn.packed_gdn_recurrent
     originals = []
     try:
-        if 'conv' in flags:
-            def conv(*args, **kwargs):
-                kwargs['round_before_silu'] = True
-                return old_conv(*args, **kwargs)
-            gdn.packed_causal_conv = conv
-        if flags & {'recurrent', 'bv', 'fma'}:
-            bv = 8 if flags & {'recurrent', 'bv'} else 32
-            fusion = not bool(flags & {'recurrent', 'fma'})
-            def recurrent(q, k, v, a, b, log, bias, pool, slots, cu):
-                total, hq, dk = q.shape
-                hv, dv = v.shape[1:]
-                out = torch.empty_like(v)
-                states = torch.empty((total, hv, dv, dk), device=pool.device, dtype=pool.dtype)
-                kernels._packed_recurrent[(slots.numel(), hv, triton.cdiv(dv, bv))](
-                    q, k, v, a, b, log, bias, pool, slots, cu, out, states,
-                    hq, hv, dk, dv, triton.next_power_of_2(dk), bv,
-                    enable_fp_fusion=fusion, num_stages=3, num_warps=4)
-                return out, states
-            gdn.packed_gdn_recurrent = recurrent
         if 'gemm' in flags:
             for module in model.modules():
                 if isinstance(module, (torch.nn.Linear, LinearBase)):
@@ -96,69 +69,8 @@ def intervention(model, name, norm_audit=None):
                             for i in range(q.shape[0])]
                         return torch.cat(rows)
                     module.forward = decode_attention
-        if 'norm_mean' in flags:
-            for module in model.modules():
-                if isinstance(module, GemmaRMSNorm):
-                    original = module.forward
-                    originals.append((module, original))
-                    def mean_matched(x, residual=None, module=module):
-                        count = min(get_context().batch_descriptor.num_tokens, x.shape[0])
-                        if x.shape[0] % count:
-                            raise ValueError('Unexpected mean token layout')
-                        combined = x if residual is None else x+residual
-                        y = combined.float()
-                        square = y.pow(2)
-                        group = x.shape[0]//count
-                        variance = torch.cat([square[i*group:(i+1)*group].mean(-1, keepdim=True)
-                                              for i in range(count)])
-                        y = y*torch.rsqrt(variance+module.eps)
-                        y = (y*(1.0+module.weight.float())).to(x.dtype)
-                        return y if residual is None else (y, combined)
-                    module.forward = mean_matched
-        norm_patterns = [re.compile(flag[5:]) for flag in flags if flag.startswith('norm:')]
-        if flags & {'pointwise', 'gemma_norm', 'gated_norm', 'activation'} or norm_patterns or norm_audit is not None:
-            for module_name, module in model.named_modules():
-                selected = ('pointwise' in flags and isinstance(module, (GemmaRMSNorm, RMSNormGated, SiluAndMul))
-                    or 'gemma_norm' in flags and isinstance(module, GemmaRMSNorm)
-                    or 'gated_norm' in flags and isinstance(module, RMSNormGated)
-                    or 'activation' in flags and isinstance(module, SiluAndMul)
-                    or isinstance(module, GemmaRMSNorm) and any(p.fullmatch(module_name) for p in norm_patterns))
-                audited = norm_audit is not None and isinstance(module, GemmaRMSNorm)
-                if selected or audited:
-                    original = module.forward
-                    originals.append((module, original))
-                    def tokenwise(x, *args, original=original, selected=selected,
-                                  audited=audited, module=module, module_name=module_name):
-                        count = get_context().batch_descriptor.num_tokens
-                        if count == 1:
-                            return original(x, *args)
-                        if x.shape[0] % count:
-                            raise ValueError('Unexpected pointwise token layout')
-                        group = x.shape[0]//count
-                        values = [original(x[i*group:(i+1)*group],
-                            *(a[i*group:(i+1)*group] if a is not None else None for a in args))
-                            for i in range(count)]
-                        split = (tuple(torch.cat([v[j] for v in values]) for j in range(len(values[0])))
-                                 if isinstance(values[0], tuple) else torch.cat(values))
-                        if audited:
-                            packed = original(x, *args)
-                            p = packed[0] if isinstance(packed, tuple) else packed
-                            s = split[0] if isinstance(split, tuple) else split
-                            stats = difference(p, s)
-                            entry = dict(module=module_name, input_shape=list(x.shape), output=stats,
-                                differing_query_rows=(p != s).reshape(count, -1).any(-1).nonzero().flatten().tolist())
-                            if not stats['equal']:
-                                entry['operands'] = dict(x=x.detach().cpu(),
-                                    residual=args[0].detach().cpu() if args and args[0] is not None else None,
-                                    weight=module.weight.detach().cpu(), eps=module.eps,
-                                    packed=p.detach().cpu(), rowwise=s.detach().cpu())
-                            norm_audit.append(entry)
-                            return split if selected else packed
-                        return split
-                    module.forward = tokenwise
         yield
     finally:
-        gdn.packed_causal_conv, gdn.packed_gdn_recurrent = old_conv, old_rec
         for module, original in reversed(originals):
             module.forward = original
 
@@ -223,7 +135,7 @@ def experiment(args, prompt, name, mode):
         reference = State(runner, seq, slot, len(prompt))
         candidate = reference
         trace, hooks = layer_trace(runner.model)
-        rows, blocks, forced, norm_records, counterfactuals = [], [], [seq.last_token], [], []
+        rows, blocks, forced, counterfactuals = [], [], [seq.last_token], []
         for offset in range(0, args.tokens, args.block):
             count = min(args.block, args.tokens-offset)
             position = len(prompt)+offset
@@ -254,27 +166,16 @@ def experiment(args, prompt, name, mode):
             trace.clear()
             # Capture final hidden directly; project one row at a time in BOTH paths.
             final = []
-            audit = [] if offset in getattr(args, 'audit_norm_offsets', []) else None
             hook = runner.model.register_forward_hook(lambda m, x, y: final.append(y.detach()))
             try:
                 plan = VerificationPlan(seq.seq_id, position, inputs[0], tuple(inputs[1:]))
-                with intervention(runner.model, name, audit):
-                    packed_forward(runner, seq, plan, slot, project=False)
+                with intervention(runner.model, name):
+                    packed_batch_forward(runner, [seq], VerificationBatch.from_plans([plan]), [slot], project=False)
                     actual = torch.cat([runner.model.compute_logits(row[None]).reshape(1, -1)
                         for row in final[0].reshape(count, -1)]).float().cpu()
             finally:
                 hook.remove()
             candidate = State(runner, seq, slot, position+count)
-            for entry in audit or []:
-                operands = entry.pop('operands', None)
-                entry.update(input_offset=offset, variant=name, state_mode=mode)
-                if operands is not None:
-                    directory = Path(args.json_out).with_suffix('').with_name(Path(args.json_out).stem+'_operands')
-                    directory.mkdir(parents=True, exist_ok=True)
-                    path = directory/f'{mode}_{name.replace(":", "_")}_{offset}_{entry["module"]}.pt'
-                    torch.save(operands, path)
-                    entry['operands_path'] = str(path)
-                norm_records.append(entry)
             state_errors = [dict(layer=layer.layer_idx, conv=difference(a[0], b[0]),
                 recurrent=difference(a[1], b[1])) for layer, a, b in
                 zip(runner.gdn_layers, reference.gdn, candidate.gdn)]
@@ -314,7 +215,7 @@ def experiment(args, prompt, name, mode):
                     hook = runner.model.register_forward_hook(lambda m, x, y: final.append(y.detach()))
                     try:
                         with intervention(runner.model, name):
-                            packed_forward(runner, seq, plan, slot, project=False)
+                            packed_batch_forward(runner, [seq], VerificationBatch.from_plans([plan]), [slot], project=False)
                             logits = torch.cat([runner.model.compute_logits(row[None]).reshape(1, -1)
                                 for row in final[0].reshape(count, -1)]).float().cpu()
                     finally:
@@ -336,7 +237,7 @@ def experiment(args, prompt, name, mode):
             teacher_tokens=forced, teacher_sha256=hashlib.sha256(json.dumps(forced).encode()).hexdigest(),
             first_flip=next((r['output_token_number'] for r in rows if not r['argmax_equal']), None),
             flips=sum(not r['argmax_equal'] for r in rows), rows=rows, blocks=blocks,
-            norm_audit=norm_records, counterfactuals=counterfactuals)
+            counterfactuals=counterfactuals)
     finally:
         for hook in hooks:
             hook.remove()
@@ -350,26 +251,36 @@ def main():
     torch.set_num_threads(1)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', default='models/Qwen3.5-0.8B')
-    parser.add_argument('--fixtures', default='logs/validate/vllm_model_baseline_20260928.json')
+    parser.add_argument('--fixtures', help='Optional full-engine fixture JSON')
+    parser.add_argument('--prompt-tokens', type=int, default=509)
     parser.add_argument('--case', default='repository_code')
     parser.add_argument('--tokens', type=int, default=128)
     parser.add_argument('--block', type=int, default=5, help='Target query count, including anchor')
-    parser.add_argument('--variants', nargs='+', default=['native', 'gemm', 'attention', 'gemm+attention'])
+    parser.add_argument('--variants', nargs='+', default=['native'])
     parser.add_argument('--state-modes', nargs='+', choices=['reset', 'rolling'], default=['reset', 'rolling'])
     parser.add_argument('--json-out', default='logs/validate/target_numerics.json')
-    parser.add_argument('--audit-norm-offsets', nargs='*', type=int, default=[])
+    parser.add_argument('--max-mean-tv', type=float, help='Declared mean probability TV budget')
+    parser.add_argument('--max-tv', type=float, help='Declared worst-position probability TV budget')
+    parser.add_argument('--max-flip-rate', type=float, help='Declared teacher-forced argmax flip-rate budget')
     parser.add_argument('--counterfactual-offsets', nargs='*', type=int, default=[])
     args = parser.parse_args()
-    if args.tokens < 1 or args.block < 1:
-        parser.error('tokens and block must be positive')
-    allowed = {'native', 'conv', 'bv', 'fma', 'recurrent', 'gemm', 'attention', 'pointwise',
-               'gemma_norm', 'gated_norm', 'activation', 'norm_mean'}
-    if any(any(flag not in allowed and not flag.startswith('norm:') for flag in name.split('+'))
-           for name in args.variants):
+    if min(args.tokens, args.block, args.prompt_tokens) < 1:
+        parser.error('tokens, block and prompt length must be positive')
+    if any(value is not None and (not math.isfinite(value) or not 0 <= value <= 1)
+           for value in (args.max_mean_tv, args.max_tv, args.max_flip_rate)):
+        parser.error('probability budgets must be finite and between zero and one')
+    allowed = {'native', 'gemm', 'attention'}
+    if any(any(flag not in allowed for flag in name.split('+')) for name in args.variants):
         parser.error('Unknown intervention')
-    fixtures = json.loads(Path(args.fixtures).read_text())
-    prompt = next(row['prompt_ids'] for row in fixtures['cases']
-                  if row['case'] == args.case and row['batch_size'] == 1)
+    if args.fixtures:
+        fixtures = json.loads(Path(args.fixtures).read_text())
+        prompt = next(row['prompt_ids'] for row in fixtures['cases']
+                      if row['case'] == args.case and row['batch_size'] == 1)
+    else:
+        from transformers import AutoTokenizer
+        from spec_workloads import natural_cases, prepare_prompt
+        prompt = prepare_prompt(AutoTokenizer.from_pretrained(args.model),
+                                natural_cases()[args.case], args.prompt_tokens, 'truncate')
     record = dict(completed=False, case=args.case, prompt_ids=prompt, model=args.model,
         dtype='bfloat16', eager=True, prefix_cache=False, tensor_parallel=1,
         logits_projection='single_row_both_paths', results=[], torch_version=torch.__version__)
@@ -381,13 +292,23 @@ def main():
     for mode in args.state_modes:
         for name in args.variants:
             result = experiment(args, prompt, name, mode)
+            result['numerical'] = numerical_summary(result['rows'], max_mean_tv=args.max_mean_tv,
+                max_tv=args.max_tv, max_flip_rate=args.max_flip_rate)
+            result['numerical']['state_finite'] = all(b['kv']['finite'] and all(
+                s['conv']['finite'] and s['recurrent']['finite'] for s in b['states'])
+                for b in result['blocks'])
             record['results'].append(result)
             if len({r['teacher_sha256'] for r in record['results']}) != 1:
                 raise AssertionError('Reference trajectory changed across experiments')
             output.write_text(json.dumps(record, indent=2))
             print(json.dumps({k: result[k] for k in ('variant', 'state_mode', 'first_flip', 'flips')}), flush=True)
     record['completed'] = True
+    record['scope'] = 'common_input_numerics; single-row LM head on both paths'
+    record['passed'] = all(r['numerical']['finite'] and r['numerical']['state_finite']
+                           and r['numerical']['budget_passed'] is not False
+                           for r in record['results'])
     output.write_text(json.dumps(record, indent=2))
+    raise SystemExit(0 if record['passed'] else 1)
 
 
 if __name__ == '__main__':

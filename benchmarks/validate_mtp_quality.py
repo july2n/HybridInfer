@@ -14,7 +14,11 @@ from hybridinfer.spec_decode import SpeculativeConfig
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--json-out', default='logs/validate/mtp1_quality.json')
+    parser.add_argument('--max-correct-drop', type=int, default=0,
+                        help='Declared allowed drop in number of correct answers versus target')
     args = parser.parse_args()
+    if not 0 <= args.max_correct_drop <= 12:
+        parser.error('max-correct-drop must be between zero and 12')
     spec = SpeculativeConfig(enabled=True, method='mtp', max_draft_tokens=1,
                              verification_mode='packed')
     engine = LLMEngine('models/Qwen3.5-0.8B', max_num_seqs=4, max_model_len=256,
@@ -43,12 +47,15 @@ def main():
         record['completed'] = True
         record['correct'] = {mode: sum(r['correct'] for r in record['cases'] if r['mode'] == mode)
                              for mode in ('baseline', 'packed')}
+        record['max_correct_drop'] = args.max_correct_drop
+        record['passed'] = record['correct']['packed'] >= record['correct']['baseline']-args.max_correct_drop
     finally:
         engine.exit()
         path = Path(args.json_out)
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(record, ensure_ascii=False, indent=2)+'\n')
     print(json.dumps(record['correct']))
+    raise SystemExit(0 if record['passed'] else 1)
 
 
 if __name__ == '__main__':

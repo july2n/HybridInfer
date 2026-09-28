@@ -47,9 +47,8 @@ class OriginalEndpointTests(unittest.TestCase):
                         k.reshape(1, 1, 2, 128).contiguous(), v.reshape(1, 1, 4, 128).contiguous(),
                         a[t:t+1], b[t:t+1], layer.A_log, layer.dt_bias, indexed_pool,
                         torch.tensor([slot], device='cuda'))
-                    # Packed uses vLLM fusion/warp layout; ordinary decode is
-                    # the older non-fused path. The pinned vLLM differential
-                    # benchmark separately requires exact equality.
+                    # Cross-provider numerics use a declared tolerance;
+                    # endpoint selection below remains exact against this trial.
                     torch.testing.assert_close(recurrent[t], indexed_pool[slot], rtol=1e-4, atol=1e-5)
                     q = q.reshape(1, 1, 2, 128).repeat_interleave(2, 2)
                     k = k.reshape(1, 1, 2, 128).repeat_interleave(2, 2)

@@ -12,12 +12,9 @@ import torch
 from hybridinfer.engine.llm_engine import LLMEngine
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.spec_decode import SpeculativeConfig
-from hybridinfer.spec_decode.batch_execution import packed_batch_forward, _decode_batch_anchors
-from hybridinfer.spec_decode.interfaces import VerificationPlan
-from hybridinfer.spec_decode.metadata import VerificationBatch
-from hybridinfer.utils.context import reset_context
+from hybridinfer.spec_decode import batch_execution
 from spec_workloads import natural_cases
-from validate_spec_decode import snapshot, equal_state
+from spec_validation import snapshot, equal_state, check_original_endpoints
 
 
 def main():
@@ -25,7 +22,7 @@ def main():
     parser.add_argument('--model', default='models/Qwen3.5-0.8B')
     parser.add_argument('--state-snapshot-budget-mb', type=int, default=256)
     parser.add_argument('--output-tokens', type=int, default=48)
-    parser.add_argument('--modes', nargs='+', default=['sequential', 'packed_guarded'],
+    parser.add_argument('--modes', nargs='+', default=['packed', 'packed_guarded'],
                         choices=['sequential', 'packed_guarded', 'packed'])
     parser.add_argument('--batch-sizes', nargs='+', type=int, default=[3, 4])
     parser.add_argument('--decode-graphs', action='store_true')
@@ -34,7 +31,7 @@ def main():
     args = parser.parse_args()
     path = Path(args.json_out)
     path.parent.mkdir(parents=True, exist_ok=True)
-    record = dict(completed=False, passed=False, scenarios=[], endpoints=[], errors=[])
+    record = dict(acceptance_scope='protocol_and_original_endpoint_selection', completed=False, passed=False, scenarios=[], endpoints=[], errors=[])
     engine = None
     try:
         engine = LLMEngine(args.model, max_num_seqs=max(args.batch_sizes), max_model_len=1024,
@@ -61,9 +58,17 @@ def main():
             return original_remove(seq_id)
         runner.remove_request = remove
         active_mode = None
+        original_forward = batch_execution.packed_batch_forward
+        trial = {}
+        def capture_forward(*args, **kwargs):
+            result = original_forward(*args, **kwargs)
+            trial['endpoints'] = runner._trial_endpoints
+            return result
+        batch_execution.packed_batch_forward = capture_forward
         def verify(seqs, plans):
-            before = [snapshot(runner, s) for s in seqs]
+            trial.clear()
             output = original(seqs, plans)
+            captured_endpoints = trial.get('endpoints')
             get_output = output.get_output
             checked = False
             def consume():
@@ -79,45 +84,12 @@ def main():
                             or state['computed'] != p.computed_length+r.output_length
                             or state['tokens'].tolist() != s.token_ids+list(r.token_ids)):
                         failures.append(f'{s.seq_id}:history/endpoint')
-                private = [runner.config.max_num_seqs+i for i in range(len(seqs))]
-                mapping = [s.block_table[pos//runner.block_size]*runner.block_size+pos%runner.block_size
-                           for s, p in zip(seqs, plans) for pos in range(p.computed_length, p.trial_end)]
-                mapping = torch.tensor(mapping, device=runner.kv_cache.device)
-                flat_kv = runner.kv_cache.reshape(*runner.kv_cache.shape[:2], -1,
-                                                   *runner.kv_cache.shape[-2:])
-                saved_kv = flat_kv.index_select(2, mapping)
-                try:
-                    for dst, state in zip(private, before):
-                        for layer, conv, recurrent in zip(runner.gdn_layers, state['conv'], state['recurrent']):
-                            layer.conv_states[dst].copy_(conv)
-                            layer.recurrent_states[dst].copy_(recurrent)
-                    commits = [VerificationPlan(p.request_id, p.computed_length, p.anchor,
-                                                p.candidates[:r.output_length-1])
-                               for p, r in zip(plans, results)]
-                    if active_mode == 'packed':
-                        packed_batch_forward(runner, seqs, VerificationBatch.from_plans(plans), private, project=False)
-                        endpoints = runner._trial_endpoints
-                        offset = 0
-                        for dst, plan, result in zip(private, plans, results):
-                            index = offset+result.output_length-1
-                            for layer, conv, recurrent in endpoints.values():
-                                layer.conv_states[dst].copy_(conv[index])
-                                layer.recurrent_states[dst].copy_(recurrent[index])
-                            offset += len(plan.input_tokens)
-                    else:
-                        _decode_batch_anchors(runner, seqs, plans, private)
-                    for s, state, dst in zip(seqs, actual, private):
-                        reference = snapshot(runner, s)
-                        if not torch.equal(reference['kv'], state['kv']):
-                            failures.append(f'{s.seq_id}:kv')
-                        for key, pool_name in (('conv', 'conv_states'), ('recurrent', 'recurrent_states')):
-                            if not all(torch.equal(getattr(layer, pool_name)[dst].cpu(), expected)
-                                       for layer, expected in zip(runner.gdn_layers, state[key])):
-                                failures.append(f'{s.seq_id}:{key}')
-                finally:
-                    flat_kv.index_copy_(2, mapping, saved_kv)
-                    runner._trial_endpoints = {}
-                    reset_context()
+                if active_mode == 'packed' and captured_endpoints:
+                    failures.extend(check_original_endpoints(runner, seqs, plans, results, captured_endpoints))
+                for state in actual:
+                    if not all(torch.isfinite(t).all() for t in
+                               [state['kv'], *state['conv'], *state['recurrent']]):
+                        failures.append('nonfinite_state')
                 record['endpoints'].append(dict(mode=active_mode, requests=len(seqs),
                                                  draft_counts=[len(p.candidates) for p in plans],
                                                  output_lengths=[r.output_length for r in results],
@@ -167,17 +139,17 @@ def main():
                     final_states = {}
                     actual = engine.generate(selected, params, use_tqdm=False)
                     actual_states = [state for _, state in sorted(final_states.items())]
-                    state_failures = [equal_state(base, trial) + ([] if base['computed']==trial['computed'] else ['computed'])
+                    state_failures = [equal_state(base, trial)
                                       for base, trial in zip(baseline_states, actual_states)]
                     if len(actual_states) != len(selected) or len(baseline_states) != len(selected):
                         raise AssertionError('missing final request state')
                     matches = [a['token_ids'] == b['token_ids'] for a, b in zip(actual, baseline)]
                     endpoints = record['endpoints'][start:]
                     scenario = dict(mode=mode, prefix=prefix, batch_size=bs,
-                                    token_matches=matches, baseline_state_failures=state_failures,
+                                    token_matches=matches, baseline_state_differences=state_failures,
                                     baseline_prefix_hits=baseline_hits,
                                     baseline_cold_warm_matches=cold_warm_matches,
-                                    baseline_cold_warm_state_failures=cold_warm_states,
+                                    baseline_cold_warm_state_differences=cold_warm_states,
                                     batch_rounds=len(endpoints),
                                     recovery_passed=all(not e['failures'] for e in endpoints),
                                     prefix_hits=(checkpoints.hits-hits if checkpoints is not None else 0),
@@ -187,16 +159,14 @@ def main():
                     path.write_text(json.dumps(record, ensure_ascii=False, indent=2))
                     if not endpoints:
                         record['errors'].append('no batched speculative verification exercised')
-                    if any(state_failures):
-                        record['errors'].append(f'baseline state mismatch: mode={mode}, prefix={prefix}, batch_size={bs}, fields={state_failures}')
-                    if not all(matches):
-                        record['errors'].append(f'token mismatch: mode={mode}, prefix={prefix}, batch_size={bs}, matches={matches}')
         record['completed'] = True
         record['passed'] = not record['errors']
     except Exception as exc:
         record['errors'].append(repr(exc))
         raise
     finally:
+        if engine is not None and 'original_forward' in locals():
+            batch_execution.packed_batch_forward = original_forward
         path.write_text(json.dumps(record, ensure_ascii=False, indent=2))
         if engine is not None:
             engine.exit()

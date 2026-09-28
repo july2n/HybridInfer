@@ -3,6 +3,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+from spec_validation import numerical_summary
 
 
 def main():
@@ -16,6 +17,7 @@ def main():
     for result in data['results']:
         rows, blocks = result['rows'], result['blocks']
         summary.append(dict(variant=result['variant'], mode=result['state_mode'],
+            numerical=result.get('numerical') or numerical_summary(rows),
             predictions=len(rows), first_flip=result['first_flip'], flips=result['flips'],
             exact_logits=sum(row['logits']['equal'] for row in rows),
             max_logit_error=max(row['logits']['max_abs'] for row in rows),
@@ -28,6 +30,7 @@ def main():
             tokens.append(dict(variant=result['variant'], mode=result['state_mode'],
                 output_token_number=row['output_token_number'], margin=row['margin'],
                 logit_max_abs=row['logits']['max_abs'], argmax_equal=row['argmax_equal'],
+                probability_tv=row['probability_tv'], probability_kl=row['probability_kl'],
                 directional_perturbation=row['directional_perturbation'],
                 contender_reference_gap=row['contender_reference_gap'],
                 first_different_layer=next((s['layer'] for s in row['layers'] if not s['equal']), None)))

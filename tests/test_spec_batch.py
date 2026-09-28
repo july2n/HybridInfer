@@ -84,7 +84,7 @@ class BatchContractTests(unittest.TestCase):
                                     remaining_output_tokens=remaining, max_model_len=20)
 
 
-def fake_batch(mode='packed', drift=False, fail_replay=False, device='cpu'):
+def fake_batch(mode='packed', drift=False, capture_endpoints=True, device='cpu'):
     n = 4
     seqs = [Sequence([1, 2, 3, 10+i], SamplingParams(temperature=0, max_tokens=10)) for i in range(3)]
     slots = (2, 0, 3)  # Input order deliberately disagrees with resident slots.
@@ -98,7 +98,7 @@ def fake_batch(mode='packed', drift=False, fail_replay=False, device='cpu'):
         seq.block_table = list(range(slot*6, slot*6+6))
         tokens[slot, :4] = torch.tensor(seq.token_ids, device=device)
         tables[slot] = torch.tensor(seq.block_table, device=device)
-    layer = SimpleNamespace(conv_states=torch.ones(2*n, 2, device=device),
+    layer = SimpleNamespace(layer_idx=0, conv_states=torch.ones(2*n, 2, device=device),
                             recurrent_states=torch.ones(2*n, 2, device=device))
     computed = torch.tensor([3, 1, 3, 3], dtype=torch.int32, device=device)
     state = SimpleNamespace(tokens=SimpleNamespace(tensor=tokens),
@@ -116,7 +116,7 @@ def fake_batch(mode='packed', drift=False, fail_replay=False, device='cpu'):
             ctx = get_context()
             calls.append(('packed' if ctx.is_prefill else 'decode', len(ids)))
             slices = ctx.prefill_slices if ctx.is_prefill else [(i, i+1) for i in range(len(ids))]
-            targets = []
+            targets, conv_snapshots, recurrent_snapshots = [], [], []
             flat = kv.reshape(2, 1, -1, 1, 1)
             for row, (begin, end) in enumerate(slices):
                 dst = int(ctx.state_indices[row])
@@ -125,12 +125,14 @@ def fake_batch(mode='packed', drift=False, fail_replay=False, device='cpu'):
                     token, position = int(ids[index]), int(positions[index])
                     for pool in (layer.conv_states, layer.recurrent_states):
                         pool[dst].add_(token)
-                    if fail_replay and dst < n:
-                        raise RuntimeError('replay failed')
                     flat[:, :, int(ctx.slot_mapping[index])] = layer.recurrent_states[dst, 0]
                     targets.append(predictions[src][position-3])
+                    conv_snapshots.append(layer.conv_states[dst].clone())
+                    recurrent_snapshots.append(layer.recurrent_states[dst].clone()+(.01 if drift and ctx.is_prefill else 0))
                 if drift and ctx.is_prefill:
                     layer.recurrent_states[dst].add_(0.01)
+            if ctx.is_prefill and capture_endpoints:
+                ctx.state_endpoints[0] = (layer, torch.stack(conv_snapshots), torch.stack(recurrent_snapshots))
             return torch.tensor(targets, device=device)[:, None]
 
         def compute_logits(self, hidden):
@@ -142,6 +144,7 @@ def fake_batch(mode='packed', drift=False, fail_replay=False, device='cpu'):
                              config=SimpleNamespace(max_num_seqs=n, max_model_len=24, eos=-1,
                                                     speculative=SpeculativeConfig(enabled=True, verification_mode=mode)),
                              gdn_layers=[layer], block_size=4, model=Model(), calls=calls, kv_cache=kv,
+                             predictions=predictions,
                              sampled_token_ids_gpu=torch.zeros(n, dtype=torch.int64, device=device),
                              spec_metrics={}, async_output=True,
                              output_copy_stream=torch.cuda.Stream() if device=='cuda' else None)
@@ -149,6 +152,25 @@ def fake_batch(mode='packed', drift=False, fail_replay=False, device='cpu'):
 
 
 class BatchExecutionTests(unittest.TestCase):
+    def test_single_request_all_acceptance_and_truncated_endpoints(self):
+        for accepted in range(4):
+            for remaining in (1, 2, 10):
+                runner, seqs, plans, slots = fake_batch()
+                seq, plan, slot = seqs[0], plans[0], slots[0]
+                seq.max_tokens = remaining
+                predictions = [20, 21, 22, 99]
+                if accepted < 3:
+                    predictions[accepted] = 88
+                runner.predictions[slot] = predictions
+                result = verify_speculative_batch(runner, [seq], [plan]).get_output()[0]
+                count = min(accepted+1, remaining)
+                self.assertEqual(result.output_length, count)
+                self.assertEqual(result.committed_computed_length, 3+count)
+                self.assertEqual(float(runner.gdn_layers[0].recurrent_states[slot, 0]),
+                                 1+sum(plan.input_tokens[:count]))
+                self.assertEqual(runner.calls, [('packed', 4)])
+                self.assertEqual(runner.spec_metrics['replay_tokens'], 0)
+
     def check_batch(self, device, mode='packed', drift=False):
         runner, seqs, plans, slots = fake_batch(mode, drift=drift, device=device)
         before = [s.token_ids.copy() for s in seqs]
@@ -172,7 +194,7 @@ class BatchExecutionTests(unittest.TestCase):
         self.assertEqual(runner.spec_metrics['rounds'], 3)
         self.assertEqual(runner.spec_metrics['batch_zero_draft_requests'], 1)
         if mode == 'packed':
-            self.assertEqual(runner.calls, [('packed', 8), ('packed', 2)])
+            self.assertEqual(runner.calls, [('packed', 8)])
             self.assertEqual(runner.spec_metrics['reference_trial_tokens'], 0)
         else:
             self.assertEqual(runner.calls, [('decode', 3)] if mode == 'sequential'
@@ -180,7 +202,7 @@ class BatchExecutionTests(unittest.TestCase):
             self.assertEqual(runner.spec_metrics['batch_reference_anchor_only'], 3)
         self.assertIsNone(get_context().state_indices)
 
-    def test_native_single_forward_and_partial_replay(self):
+    def test_native_single_forward_selects_original_endpoints(self):
         self.check_batch('cpu')
 
     def test_guarded_and_sequential_keep_reference_state(self):
@@ -191,14 +213,26 @@ class BatchExecutionTests(unittest.TestCase):
     def test_cuda_commit_and_async_output(self):
         self.check_batch('cuda')
 
-    def test_replay_exception_rolls_back_all_requests(self):
-        runner, seqs, plans, slots = fake_batch(fail_replay=True)
+    def test_endpoint_commit_failure_rolls_back_all_requests(self):
+        runner, seqs, plans, slots = fake_batch()
         tokens = runner.request_state.tokens.tensor.clone()
         computed = runner.request_state.computed.tensor.clone()
-        with self.assertRaisesRegex(RuntimeError, 'replay failed'):
-            verify_speculative_batch(runner, seqs, plans)
+        def fail(*args):
+            runner.gdn_layers[0].recurrent_states[slots[0]].add_(99)
+            raise RuntimeError('commit failed')
+        with patch('hybridinfer.spec_decode.batch_execution.select_endpoints', side_effect=fail):
+            with self.assertRaisesRegex(RuntimeError, 'commit failed'):
+                verify_speculative_batch(runner, seqs, plans)
         self.assertTrue(torch.equal(runner.request_state.tokens.tensor, tokens))
         self.assertTrue(torch.equal(runner.request_state.computed.tensor, computed))
+        for slot in slots:
+            self.assertTrue(torch.equal(runner.gdn_layers[0].recurrent_states[slot], torch.ones(2)))
+
+    def test_missing_endpoints_aborts_without_target_replay(self):
+        runner, seqs, plans, slots = fake_batch(capture_endpoints=False)
+        with self.assertRaisesRegex(RuntimeError, 'missing original GDN endpoints'):
+            verify_speculative_batch(runner, seqs, plans)
+        self.assertEqual(runner.calls, [('packed', 8)])
         for slot in slots:
             self.assertTrue(torch.equal(runner.gdn_layers[0].recurrent_states[slot], torch.ones(2)))
 

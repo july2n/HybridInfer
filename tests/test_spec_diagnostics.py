@@ -2,11 +2,12 @@
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'benchmarks'))
-from validate_spec_natural import prediction_diagnostics
+from spec_validation import prediction_diagnostics, numerical_summary, check_original_endpoints
 from spec_workloads import prepare_prompt
 from bench_spec_decode import summarize_samples
 
@@ -35,7 +36,7 @@ class SpecDiagnosticTests(unittest.TestCase):
         self.assertEqual(prepare_prompt(Tokenizer(), 'short', 8, 'repeat_and_truncate'),
                          [1, 2, 3, 1, 2, 3, 1, 2])
 
-    def test_different_outputs_do_not_produce_an_accepted_speedup(self):
+    def test_different_outputs_keep_labeled_time_ratio(self):
         def sample(tokens, seconds):
             return dict(tokens=tokens, decode_seconds=seconds, generation_seconds=seconds,
                         decode_tokens_per_second=len(tokens)/seconds,
@@ -51,6 +52,40 @@ class SpecDiagnosticTests(unittest.TestCase):
     def test_unpaired_measurements_are_rejected(self):
         with self.assertRaises(ValueError):
             summarize_samples([], [])
+
+    def test_numerical_budget_allows_nonidentical_logits(self):
+        row = dict(probability_tv=.01, probability_kl=.001, argmax_equal=False,
+                   logits=dict(equal=False, finite=True))
+        summary = numerical_summary([row], max_mean_tv=.02)
+        self.assertTrue(summary['budget_passed'])
+        self.assertEqual(summary['exact_logits'], 0)
+        self.assertFalse(numerical_summary([row], max_flip_rate=.5)['budget_passed'])
+        self.assertIsNone(numerical_summary([row])['budget_passed'])
+
+    def test_nonfinite_and_invalid_budgets_are_rejected(self):
+        row = dict(probability_tv=float('nan'), probability_kl=0., argmax_equal=True,
+                   logits=dict(equal=False, finite=False))
+        self.assertFalse(numerical_summary([row], max_tv=.1)['budget_passed'])
+        for value in (-.1, 1.1, float('nan')):
+            with self.assertRaises(ValueError):
+                numerical_summary([row], max_mean_tv=value)
+
+    def test_selection_is_exact_against_original_trial_not_single_decode(self):
+        layer = SimpleNamespace(layer_idx=0, conv_states=torch.tensor([[2.]]),
+                                recurrent_states=torch.tensor([[20.]]))
+        runner = SimpleNamespace(gdn_layers=[layer],
+            input_batch=SimpleNamespace(seq_id_to_slot={7: 0}))
+        seqs = [SimpleNamespace(seq_id=7)]
+        plans = [SimpleNamespace(input_tokens=(1, 2, 3))]
+        results = [SimpleNamespace(output_length=2)]
+        endpoints = {0: (layer, torch.tensor([[1.], [2.], [3.]]),
+                         torch.tensor([[10.], [20.], [30.]]))}
+        self.assertEqual(check_original_endpoints(runner, seqs, plans, results, endpoints), [])
+        layer.recurrent_states.add_(.00001)
+        self.assertEqual(check_original_endpoints(runner, seqs, plans, results, endpoints)[0]['failed'],
+                         ['recurrent:0'])
+        with self.assertRaises(AssertionError):
+            check_original_endpoints(runner, seqs, plans, [], endpoints)
 
 
 if __name__ == '__main__':
