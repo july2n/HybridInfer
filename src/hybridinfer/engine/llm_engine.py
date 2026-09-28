@@ -148,7 +148,18 @@ class LLMEngine:
         more decode; new prefill work is still allowed to dispatch so
         late arrivals keep making progress.
         """
-        # P1 synchronous reference runs only when every queued batch has drained.
+        # Speculative transactions start only after queued batches drain.
+        # Single-request diagnostics keep their established reference hook.
+        if not self.batch_queue and len(self.scheduler.running) > 1:
+            batch = self.scheduler.begin_speculative_batch()
+            if batch is not None:
+                seqs, plans = batch
+                try:
+                    output = self.model_runner.call("verify_speculative_batch", seqs, plans)
+                except Exception:
+                    self.scheduler.abort_speculative_batch(seqs)
+                    raise
+                self.batch_queue.append((seqs, "spec_decode", 0, output))
         if not self.batch_queue:
             speculative = self.scheduler.begin_speculative()
             if speculative is not None:
@@ -260,6 +271,15 @@ class LLMEngine:
             args={"prefill": is_prefill, "bs": len(seqs)},
         ):
             token_ids = async_output.get_output()
+
+        if is_prefill == "spec_decode":
+            results = token_ids
+            for seq, result in zip(seqs, results):
+                self.scheduler.finish_speculative(seq, result)
+                if result.finished:
+                    self.model_runner.call("remove_request", seq.seq_id)
+            outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+            return outputs, -sum(result.output_length for result in results)
 
         for seq, token_id in zip(seqs, token_ids):
             if (

@@ -79,9 +79,13 @@ finally:
 - [混合模型前缀缓存](docs/prefix_caching.md)
 - [CUDA Graph 与缓冲区管理](docs/cuda_graph_optimization.md)
 - [GDN 内核与共享预填充实现](docs/gdn_kernel_optimization.md)
+- [投机解码实施计划](docs/speculative_decoding_plan.md)
+- [投机解码实现进度与验收边界](docs/speculative_decoding_progress.md)
 - [模型数值验收记录](docs/qwen35_acceptance.md)
 
 ## 后续计划
 
-- [ ] 支持投机采样。
+- [x] 单请求 n-gram 贪心投机解码执行链路（默认关闭；开启后保守验证，native packed 仍为实验选项）。
+- [x] 变长多请求 n-gram 贪心验证、GPU 接受/提交与异步输出句柄（GDN 重放仍需取回长度，完整系统验收见实施记录）。
+- [ ] 随机投机采样及 MTP/EAGLE/DFlash 草稿。
 - [ ] 支持 MoE 模型。

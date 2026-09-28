@@ -8,6 +8,7 @@ from hybridinfer.spec_decode.verifier import accept_greedy
 class ContractTests(unittest.TestCase):
     def test_disabled_default_and_validation(self):
         self.assertFalse(SpeculativeConfig().enabled)
+        self.assertEqual(SpeculativeConfig(enabled=True).verification_mode, 'packed_guarded')
         for kwargs in ({'method': 'mtp'}, {'max_draft_tokens': 0},
                        {'ngram_min': 3, 'ngram_max': 2}, {'verification_mode': 'batch'}):
             with self.assertRaises(ValueError):

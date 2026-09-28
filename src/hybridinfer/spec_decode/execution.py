@@ -7,6 +7,7 @@ from hybridinfer.utils.context import BatchDescriptor, set_context, reset_contex
 from .state import GDNTransaction
 from .verifier import accept_greedy
 from .interfaces import VerificationPlan
+from .metadata import VerificationBatch
 
 
 @torch.inference_mode()
@@ -31,7 +32,10 @@ def packed_forward(runner, seq, plan, state_slot, *, project=True):
                 batch_descriptor=BatchDescriptor(mode='spec_decode', num_tokens=count, num_reqs=1,
                                                  uniform_token_count=count, max_query_len=count))
     hidden = runner.model(torch.tensor(plan.input_tokens, dtype=torch.int64, device=device), positions)
-    return runner.model.compute_logits(hidden) if project else None
+    if not project:
+        return None
+    metadata = VerificationBatch.from_plans([plan]).tensors(device)
+    return metadata.select_logits(hidden, runner.model.compute_logits)
 
 
 @torch.inference_mode()

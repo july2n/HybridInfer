@@ -77,8 +77,9 @@ def same_block_reference(runner, seq, plan, result, before):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='models/Qwen3.5-0.8B')
-    parser.add_argument('--json-out', default='logs/validate/spec_sequential.json')
-    parser.add_argument('--verification-mode', choices=('packed', 'sequential', 'packed_guarded'), default='packed')
+    parser.add_argument('--json-out', default='logs/validate/spec_decode.json')
+    parser.add_argument('--verification-mode', choices=('packed', 'sequential', 'packed_guarded'),
+                        default=SpeculativeConfig().verification_mode)
     args = parser.parse_args()
     engine = LLMEngine(args.model, max_num_seqs=2, max_model_len=1024,
                        max_num_batched_tokens=1024, gpu_memory_utilization=0.6,

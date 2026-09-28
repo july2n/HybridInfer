@@ -188,6 +188,19 @@ class RoutingTests(unittest.TestCase):
 
 
 class PackedGuardTests(unittest.TestCase):
+    def test_enabled_default_recovers_reference_tokens_and_state_on_native_divergence(self):
+        seq = Sequence([1, 2, 3, 4], SamplingParams(temperature=0, max_tokens=10))
+        seq.num_cached_tokens = 3
+        seq.block_table = [0, 1, 2]
+        runner = make_runner(seq, [5, 6, 7, 8], packed_state_drift=True, packed_token_drift=True)
+        runner.config.speculative = SpeculativeConfig(enabled=True)
+        result = verify_speculative(runner, seq, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7)))
+        self.assertEqual(result.token_ids, (5, 6, 7, 8))
+        self.assertTrue(torch.equal(runner.gdn_layers[0].recurrent_states[1], torch.full((2,), 23.)))
+        self.assertEqual(runner.spec_metrics['packed_fallbacks'], 1)
+        self.assertEqual(runner.spec_metrics['packed_token_mismatches'], 1)
+        self.assertEqual(runner.spec_metrics['reference_trial_tokens'], 4)
+
     def test_packed_rows_state_and_conservative_fallback(self):
         for state_drift, token_drift in ((False, False), (True, False), (False, True)):
             seq = Sequence([1, 2, 3, 4], SamplingParams(temperature=0, max_tokens=10))
@@ -231,10 +244,10 @@ class NativePackedTests(unittest.TestCase):
         seq.num_cached_tokens = 3
         seq.block_table = [0, 1, 2]
         runner = make_runner(seq, predictions, **kwargs)
-        runner.config.speculative = SpeculativeConfig(enabled=True)
+        runner.config.speculative = SpeculativeConfig(enabled=True, verification_mode='packed')
         return seq, runner, VerificationPlan(seq.seq_id, 3, 4, (5, 6, 7))
 
-    def test_default_packed_accepts_native_predictions_and_state_without_reference(self):
+    def test_explicit_packed_accepts_native_predictions_and_state_without_reference(self):
         from unittest.mock import patch
         seq, runner, plan = self.ready([5, 6, 7, 8], packed_state_drift=True)
         self.assertEqual(runner.config.speculative.verification_mode, 'packed')

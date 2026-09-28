@@ -248,7 +248,7 @@ class ModelRunner:
         num_slots = self.config.max_num_seqs
         speculative = self.config.speculative
         if speculative and speculative.enabled:
-            num_slots += 1  # Private synchronous trial slot, never a prefix snapshot.
+            num_slots *= 2  # One private trial slot per active verification request.
         for layer in self.gdn_layers:
             layer.allocate_state_pool(num_slots)
 
@@ -357,6 +357,10 @@ class ModelRunner:
     def verify_speculative(self, seq, plan):
         from hybridinfer.spec_decode.execution import verify_speculative
         return verify_speculative(self, seq, plan)
+
+    def verify_speculative_batch(self, seqs, plans):
+        from hybridinfer.spec_decode.batch_execution import verify_speculative_batch
+        return verify_speculative_batch(self, seqs, plans)
 
     def execute_model(self, seqs: list[Sequence], is_prefill: bool) -> None:
         """MRV2 step: prepare inputs, enqueue the forward, return None.

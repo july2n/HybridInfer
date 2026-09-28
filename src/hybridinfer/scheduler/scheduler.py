@@ -11,6 +11,7 @@ class Scheduler:
     def __init__(self, config: Config):
         self.speculative = getattr(config, "speculative", None)
         self.spec_fallbacks = {}
+        self._spec_trial_block_counts = {}
         self.max_num_seqs = config.max_num_seqs
         self.max_model_len = config.max_model_len
         self.max_num_batched_tokens = config.max_num_batched_tokens
@@ -67,6 +68,55 @@ class Scheduler:
         self.in_flight.add(seq.seq_id)
         return seq, plan
 
+    def begin_speculative_batch(self):
+        """Reserve a greedy decode batch, including zero-draft anchor rows."""
+        config = self.speculative
+        if not config or not config.enabled:
+            return None
+        def fallback(reason):
+            self.spec_fallbacks[reason] = self.spec_fallbacks.get(reason, 0)+1
+            return None
+        if self.waiting or self.in_flight or not self.running:
+            return fallback("batch_or_prefill")
+        from hybridinfer.spec_decode.interfaces import DraftContext, VerificationPlan
+        from hybridinfer.spec_decode.ngram import NgramProposer
+        seqs = list(self.running)[:min(self.max_num_seqs, self.max_num_batched_tokens)]
+        if any(seq.temperature != 0 for seq in seqs):
+            return fallback("temperature")
+        remaining = self.max_num_batched_tokens
+        plans = []
+        proposer = NgramProposer(config)
+        for row, seq in enumerate(seqs):
+            # Reserve at least one anchor row for each later request.
+            budget = remaining-(len(seqs)-row-1)
+            context = DraftContext(seq.seq_id, tuple(seq.token_ids), seq.num_cached_tokens,
+                                   seq.max_tokens-seq.num_completion_tokens,
+                                   self.max_model_len, budget)
+            candidates = proposer.propose([context]).tokens_for(0)
+            plan = VerificationPlan(seq.seq_id, seq.num_cached_tokens, seq.last_token, candidates)
+            plans.append(plan)
+            remaining -= len(plan.input_tokens)
+        if not any(p.candidates for p in plans):
+            return fallback("no_draft_or_budget")
+        original_counts = {seq.seq_id: len(seq.block_table) for seq in seqs}
+        for seq, plan in zip(seqs, plans):
+            if not self.block_manager.reserve_trial(seq, plan.trial_end):
+                for reserved in seqs:
+                    self.block_manager.trim_trial(reserved, original_counts[reserved.seq_id]*self.block_size)
+                return fallback("kv_capacity_or_shared_tail")
+        self._spec_trial_block_counts.update(original_counts)
+        for seq in seqs:
+            self.running.remove(seq)
+            self.in_flight.add(seq.seq_id)
+        return seqs, tuple(plans)
+
+    def abort_speculative_batch(self, seqs):
+        for seq in reversed(seqs):
+            original = self._spec_trial_block_counts.pop(seq.seq_id)
+            self.block_manager.trim_trial(seq, original*self.block_size)
+            self.in_flight.discard(seq.seq_id)
+            self.running.appendleft(seq)
+
     def abort_speculative(self, seq):
         self.block_manager.trim_trial(seq, seq.num_cached_tokens)
         self.in_flight.discard(seq.seq_id)
@@ -75,6 +125,7 @@ class Scheduler:
     def finish_speculative(self, seq, result):
         if seq.seq_id not in self.in_flight:
             raise RuntimeError("speculative request is not in flight")
+        self._spec_trial_block_counts.pop(seq.seq_id, None)
         seq.append_tokens(result.token_ids)
         seq.num_scheduled_tokens = result.committed_computed_length - seq.num_cached_tokens
         self.block_manager.trim_trial(seq, result.committed_computed_length)
