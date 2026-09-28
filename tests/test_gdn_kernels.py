@@ -9,6 +9,76 @@ from hybridinfer.layers.gdn_kernels import packed_causal_conv, indexed_gdn_decod
 @unittest.skipUnless(torch.cuda.is_available(), 'CUDA required')
 class GDNKernelTests(unittest.TestCase):
     @torch.inference_mode()
+    def test_compact_conv_history_matches_all_original_endpoints(self):
+        from hybridinfer.layers.gdn_kernels import conv_endpoints, compact_conv_endpoints
+        for lengths in ([2], [1, 2, 5, 9], [9, 1, 3]):
+            channels, width = 137, 3
+            x = torch.randn(sum(lengths), channels, device='cuda', dtype=torch.bfloat16)
+            pool = torch.randn(7, channels, width, device='cuda', dtype=torch.bfloat16)
+            slots = torch.tensor([5, 1, 3, 0][:len(lengths)], device='cuda')
+            bounds = [0]
+            for length in lengths:
+                bounds.append(bounds[-1]+length)
+            cu = torch.tensor(bounds, device='cuda', dtype=torch.int32)
+            old = pool.clone()
+            expected = conv_endpoints(x, pool, slots, cu)
+            compact = compact_conv_endpoints(x, pool, slots, cu, max(lengths))
+            indices = torch.arange(x.shape[0], device='cuda').flip(0)
+            self.assertTrue(torch.equal(compact.index_select(0, indices), expected[indices]))
+            chosen = torch.tensor([end-1 for end in bounds[1:]], device='cuda')
+            compact.commit(pool, slots, chosen)
+            self.assertTrue(torch.equal(pool[slots], expected[chosen]))
+            idle = [i for i in range(7) if i not in slots.tolist()]
+            self.assertTrue(torch.equal(pool[idle], old[idle]))
+            self.assertEqual(compact.history.numel(), (sum(lengths)+len(lengths)*width)*channels)
+
+    @torch.inference_mode()
+    def test_decode_conv_matches_packed_vllm_arithmetic(self):
+        for count in (1, 5, 9):
+            torch.manual_seed(62)
+            x = torch.randn(count, 137, device='cuda', dtype=torch.bfloat16)
+            weights = torch.randn(137, 1, 4, device='cuda', dtype=torch.bfloat16)
+            pool = torch.randn(3, 137, 3, device='cuda', dtype=torch.bfloat16)
+            ordinary = pool.clone()
+            idle = pool[[0, 2]].clone()
+            slots = torch.tensor([1], device='cuda')
+            cu = torch.tensor([0, count], device='cuda', dtype=torch.int32)
+            expected = packed_causal_conv(x, weights, pool, slots, cu, count,
+                                         round_before_silu=False)
+            actual = torch.cat([packed_causal_conv(row[None], weights, ordinary,
+                slots, None, 1, decode=True, round_before_silu=False) for row in x])
+            self.assertTrue(torch.equal(actual, expected))
+            self.assertTrue(torch.equal(ordinary, pool))
+            self.assertTrue(torch.equal(pool[[0, 2]], idle))
+
+    @torch.inference_mode()
+    def test_decode_matches_original_packed_endpoints(self):
+        from hybridinfer.layers.gdn_kernels import packed_gdn_recurrent
+        for hq, hv in ((2, 4), (16, 16)):
+            torch.manual_seed(47)
+            count = 5
+            q = torch.randn(count, hq, 128, device='cuda', dtype=torch.bfloat16)
+            k = torch.randn_like(q)
+            v = torch.randn(count, hv, 128, device='cuda', dtype=torch.bfloat16)
+            a = torch.randn(count, hv, device='cuda', dtype=torch.bfloat16)
+            b = torch.randn_like(a)
+            log = torch.randn(hv, device='cuda')
+            bias = torch.randn(hv, device='cuda', dtype=torch.bfloat16)
+            pool = torch.randn(3, hv, 128, 128, device='cuda')*.1
+            initial = pool.clone()
+            ordinary = pool.clone()
+            slots = torch.tensor([1], device='cuda')
+            cu = torch.tensor([0, count], device='cuda', dtype=torch.int32)
+            output, states = packed_gdn_recurrent(q, k, v, a, b, log, bias, pool, slots, cu)
+            for i in range(count):
+                actual = indexed_gdn_decode(q[i:i+1,None], k[i:i+1,None], v[i:i+1,None],
+                    a[i:i+1], b[i:i+1], log, bias, ordinary, slots)
+                self.assertTrue(torch.equal(actual.reshape_as(output[i]), output[i]))
+                self.assertTrue(torch.equal(ordinary[1], states[i]))
+            self.assertTrue(torch.equal(pool[[0,2]], initial[[0,2]]))
+            self.assertTrue(torch.equal(ordinary[[0,2]], initial[[0,2]]))
+
+    @torch.inference_mode()
     def test_packed_conv_short_histories_boundaries_and_slot_reordering(self):
         for dtype in (torch.bfloat16, torch.float16):
             for lengths in ([1, 2, 3, 5, 17], [63, 64, 65], [129, 1]):

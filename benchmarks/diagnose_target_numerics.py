@@ -37,7 +37,11 @@ def difference(reference, candidate):
 
 @contextmanager
 def intervention(model, name, norm_audit=None):
-    """All overrides are restored even when an experiment fails."""
+    """Restore overrides on failure; conv/BV/FMA retain historical interventions.
+
+    Those historical controls select the pre-alignment ordinary arithmetic,
+    rather than the current shared decode/verification arithmetic.
+    """
     flags = set(name.split('+'))
     old_conv, old_rec = gdn.packed_causal_conv, gdn.packed_gdn_recurrent
     originals = []
@@ -284,6 +288,9 @@ def experiment(args, prompt, name, mode):
                 margin = float(top.values[0]-top.values[1])
                 other = contender if contender != winner else int(top.indices[1])
                 delta = actual[i]-expected[i]
+                ref_logp = expected[i].log_softmax(-1)
+                trial_logp = actual[i].log_softmax(-1)
+                ref_p, trial_p = ref_logp.exp(), trial_logp.exp()
                 layer_errors = [dict(layer=j, **difference(expected_trace[j][i], actual_trace[j][i]))
                                 for j in expected_trace]
                 rows.append(dict(input_position=position+i, output_token_number=offset+i+2,
@@ -291,6 +298,8 @@ def experiment(args, prompt, name, mode):
                     margin=margin, contender_reference_gap=float(expected[i,winner]-expected[i,other]),
                     directional_perturbation=float(delta[other]-delta[winner]),
                     candidate_gap=float(actual[i,winner]-actual[i,other]),
+                    probability_tv=float((ref_p-trial_p).abs().sum()*.5),
+                    probability_kl=float((ref_p*(ref_logp-trial_logp)).sum()),
                     reference_logits_pair=[float(expected[i,winner]), float(expected[i,other])],
                     candidate_logits_pair=[float(actual[i,winner]), float(actual[i,other])],
                     logits=difference(expected[i], actual[i]), layers=layer_errors))
@@ -336,14 +345,16 @@ def experiment(args, prompt, name, mode):
 
 
 def main():
+    # Probability diagnostics run on CPU; avoid large thread pools for these
+    # reductions. GPU target execution is unchanged.
+    torch.set_num_threads(1)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', default='models/Qwen3.5-0.8B')
     parser.add_argument('--fixtures', default='logs/validate/vllm_model_baseline_20260928.json')
     parser.add_argument('--case', default='repository_code')
     parser.add_argument('--tokens', type=int, default=128)
     parser.add_argument('--block', type=int, default=5, help='Target query count, including anchor')
-    parser.add_argument('--variants', nargs='+', default=['native', 'conv', 'bv', 'fma', 'recurrent',
-        'gemm', 'conv+recurrent+gemm', 'conv+recurrent+gemm+attention'])
+    parser.add_argument('--variants', nargs='+', default=['native', 'gemm', 'attention', 'gemm+attention'])
     parser.add_argument('--state-modes', nargs='+', choices=['reset', 'rolling'], default=['reset', 'rolling'])
     parser.add_argument('--json-out', default='logs/validate/target_numerics.json')
     parser.add_argument('--audit-norm-offsets', nargs='*', type=int, default=[])
@@ -362,6 +373,9 @@ def main():
     record = dict(completed=False, case=args.case, prompt_ids=prompt, model=args.model,
         dtype='bfloat16', eager=True, prefix_cache=False, tensor_parallel=1,
         logits_projection='single_row_both_paths', results=[], torch_version=torch.__version__)
+    record['operator_source_sha256'] = {name: hashlib.sha256(
+        (Path(__file__).resolve().parents[1]/'src/hybridinfer/layers'/name).read_bytes()).hexdigest()
+        for name in ('gdn_kernels.py', 'gated_delta_net.py', 'layernorm.py', 'norm_kernels.py', 'attention.py')}
     output = Path(args.json_out)
     output.parent.mkdir(parents=True, exist_ok=True)
     for mode in args.state_modes:

@@ -70,6 +70,9 @@ def main():
     parser.add_argument('--vllm-baseline', default='logs/validate/vllm_model_baseline_20260928.json')
     parser.add_argument('--json-out', default='logs/validate/mtp_alignment_implementation.json')
     parser.add_argument('--output-tokens', type=int, default=128)
+    parser.add_argument('--draft-tokens', type=int, default=4)
+    parser.add_argument('--allow-token-differences', action='store_true',
+                        help='Report token differences; fail only structural/execution checks')
     parser.add_argument('--batch-sizes', nargs='+', type=int, default=[1, 4])
     parser.add_argument('--modes', nargs='+', default=['baseline', 'packed', 'packed_guarded'])
     args = parser.parse_args()
@@ -83,7 +86,7 @@ def main():
     fixtures = {row['case']: row['prompt_ids'] for row in source['cases'] if row['batch_size'] == 1}
     references = {(row['case'], row['batch_size']): row for row in source['cases']}
     record = dict(completed=False, passed=False, cases=[], endpoint_checks=0, endpoint_failures=[],
-                  output_tokens=args.output_tokens, reference=args.vllm_baseline)
+                  output_tokens=args.output_tokens, max_draft_tokens=args.draft_tokens, reference=args.vllm_baseline)
     own_references = {}
     capture = {}
     original_forward = batch_execution.packed_batch_forward
@@ -96,7 +99,7 @@ def main():
     try:
         for mode in args.modes:
             spec = None if mode == 'baseline' else SpeculativeConfig(
-                enabled=True, method='mtp', max_draft_tokens=4, verification_mode=mode)
+                enabled=True, method='mtp', max_draft_tokens=args.draft_tokens, verification_mode=mode)
             engine = LLMEngine(args.model, max_num_seqs=max(args.batch_sizes),
                 max_model_len=max(map(len, fixtures.values()))+args.output_tokens+16,
                 max_num_batched_tokens=2048, gpu_memory_utilization=.6,
@@ -180,7 +183,7 @@ def main():
         Path(args.json_out).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json_out).write_text(json.dumps(record, ensure_ascii=False, indent=2)+'\n')
     print(json.dumps({k: v for k, v in record.items() if k not in ('cases', 'weight_report')}, indent=2))
-    raise SystemExit(0 if record['passed'] else 1)
+    raise SystemExit(0 if (record['execution_passed'] if args.allow_token_differences else record['passed']) else 1)
 
 
 if __name__ == '__main__':

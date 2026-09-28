@@ -55,6 +55,9 @@ class GemmaRMSNorm(nn.Module):
     *increment* around 1.0: output = x_normed * (1 + weight).
     Weight starts at 0, so the scale is 1 before loading.
 
+    CUDA uses a fixed per-row reduction and an FP32 residual sum, matching
+    vLLM's default compiled norm. CPU retains the eager reference formula.
+
     Checkpoint evidence (Qwen3.5-0.8B): q_norm/k_norm weights are
     bf16 tensors centered near 0 with range ~[-1, 1], i.e. the
     1+weight semantics; linear_attn.norm (standard semantics) is a
@@ -106,6 +109,9 @@ class GemmaRMSNorm(nn.Module):
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if x.is_cuda:
+            from hybridinfer.layers.norm_kernels import gemma_norm
+            return gemma_norm(x, self.weight, self.eps, residual)
         if residual is None:
             return self.rms_forward(x)
         else:

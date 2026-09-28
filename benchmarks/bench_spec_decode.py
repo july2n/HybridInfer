@@ -1,4 +1,4 @@
-"""Offline single-request n-gram benchmark, without state snapshots or oracle drafts."""
+"""Offline single-request n-gram or real MTP benchmark with paired target runs."""
 import argparse
 import json
 import statistics
@@ -54,8 +54,10 @@ def main():
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--warmups', type=int, default=1)
     parser.add_argument('--draft-tokens', type=int, default=4)
+    parser.add_argument('--method', choices=('ngram', 'mtp'), default='ngram')
     parser.add_argument('--enforce-eager', action='store_true')
     parser.add_argument('--suite', choices=('synthetic', 'natural'), default='synthetic')
+    parser.add_argument('--cases', nargs='+', help='Subset of named cases from the selected suite')
     parser.add_argument('--draft-sweep', type=int, nargs='+', help='Candidate limits, e.g. 1 2 4 8')
     parser.add_argument('--modes', nargs='+', choices=('baseline', 'sequential', 'packed', 'packed_guarded'),
                         default=['baseline', 'packed'])
@@ -70,16 +72,20 @@ def main():
         parser.error('positive draft limits and unique modes including baseline are required')
     normalization = 'truncate' if args.suite == 'natural' else 'repeat_and_truncate'
     cases = natural_cases() if args.suite == 'natural' else CASES
+    if args.cases:
+        if len(set(args.cases)) != len(args.cases) or any(name not in cases for name in args.cases):
+            parser.error('cases must be unique names from the selected suite')
+        cases = {name: cases[name] for name in args.cases}
     engine = LLMEngine(args.model, max_num_seqs=2,
                        max_model_len=args.prompt_tokens+args.output_tokens+8,
                        max_num_batched_tokens=max(512, args.prompt_tokens),
                        enforce_eager=args.enforce_eager, use_prefill_cudagraph=False,
                        gpu_memory_utilization=0.6, enable_prefix_cache=False,
-                       speculative=SpeculativeConfig(enabled=True))
+                       speculative=SpeculativeConfig(enabled=True, method=args.method))
     records = []
-    def run(prompt, mode, draft_limit):
+    def measure(prompt, mode, draft_limit):
         config = SpeculativeConfig(enabled=True, verification_mode=mode,
-                                   max_draft_tokens=draft_limit) if mode != 'baseline' else None
+                                   method=args.method, max_draft_tokens=draft_limit) if mode != 'baseline' else None
         engine.config.speculative = engine.scheduler.speculative = config
         engine.add_request(prompt, SamplingParams(temperature=0, max_tokens=args.output_tokens, ignore_eos=True))
         seq = engine.scheduler.waiting[-1]
@@ -105,6 +111,18 @@ def main():
                     decode_tokens_per_second=count/(end-prefill_end), metrics=metrics,
                     scheduler_fallbacks=fallbacks,
                     peak_allocated_bytes=torch.cuda.max_memory_allocated(), tokens=seq.completion_token_ids)
+
+    def run(prompt, mode, draft_limit):
+        # Share allocations, but exclude MTP feature recording from baseline.
+        # Restore ownership even if measurement fails.
+        proposer = engine.model_runner.draft_proposer
+        try:
+            if mode == 'baseline':
+                engine.model_runner.draft_proposer = None
+            return measure(prompt, mode, draft_limit)
+        finally:
+            engine.model_runner.draft_proposer = proposer
+
     completed = False
     try:
         for name, text in cases.items():
@@ -145,9 +163,12 @@ def main():
                         warmups_per_case_mode=args.warmups, repeats=args.repeats,
                         prompt_tokens=args.prompt_tokens, output_tokens=args.output_tokens,
                         prompt_normalization=normalization, suite=args.suite,
+                        case_names=list(cases),
                         measurement_order='rotating_interleaved', modes=args.modes,
                         enabled_default_verification=SpeculativeConfig().verification_mode,
                         max_draft_tokens=draft_limits, token_match_required=args.require_token_match,
+                        draft_method=args.method,
+                        baseline_target_feature_tracking=False,
                         scope='offline decode and whole generation')
         engine.exit()
         path = Path(args.json_out)

@@ -1,4 +1,6 @@
 """Packed causal convolution and FP32 indexed GDN decode kernels."""
+from functools import lru_cache
+
 import torch
 import triton
 import triton.language as tl
@@ -82,45 +84,27 @@ def packed_causal_conv(x, weight, states, slots, cu_seqlens, max_len, *, decode=
     return output
 
 
-@triton.jit
-def _decode(Q, Kptr, Vptr, A, Bptr, Log, Bias, Pool, Slots, Out,
-            HQ: tl.constexpr, HV: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
-            BK: tl.constexpr, BV: tl.constexpr):
-    batch = tl.program_id(0)
-    head = tl.program_id(1)
-    rows = tl.program_id(2) * BV + tl.arange(0, BV)
-    cols = tl.arange(0, BK)
-    slot = tl.load(Slots + batch)
-    qhead = head // (HV // HQ)
-    q = tl.load(Q + (batch * HQ + qhead) * DK + cols, cols < DK, other=0).to(tl.float32)
-    k = tl.load(Kptr + (batch * HQ + qhead) * DK + cols, cols < DK, other=0).to(tl.float32)
-    q = q * tl.rsqrt(tl.sum(q * q, 0) + 1e-6) * (DK ** -0.5)
-    k = k * tl.rsqrt(tl.sum(k * k, 0) + 1e-6)
-    a = tl.load(A + batch * HV + head).to(tl.float32)
-    b = tl.load(Bptr + batch * HV + head).to(tl.float32)
-    x = a + tl.load(Bias + head).to(tl.float32)
-    softplus = tl.where(x > 20, x, tl.log(1 + tl.exp(tl.minimum(x, 20))))
-    decay = tl.exp(-tl.exp(tl.load(Log + head).to(tl.float32)) * softplus)
-    beta = tl.sigmoid(b)
-    ptr = Pool + ((slot * HV + head) * DV + rows[:, None]) * DK + cols[None, :]
-    mask = (rows[:, None] < DV) & (cols[None, :] < DK)
-    h = tl.load(ptr, mask, other=0) * decay
-    v = tl.load(Vptr + (batch * HV + head) * DV + rows, rows < DV, other=0).to(tl.float32)
-    delta = (v - tl.sum(h * k[None, :], 1)) * beta
-    h = h + delta[:, None] * k[None, :]
-    tl.store(ptr, h, mask)
-    y = tl.sum(h * q[None, :], 1)
-    tl.store(Out + (batch * HV + head) * DV + rows, y, rows < DV)
+@lru_cache(maxsize=32)
+def _decode_offsets(batch, device):
+    return torch.arange(batch+1, dtype=torch.int32, device=device)
 
 
 def indexed_gdn_decode(q, k, v, a, b, a_log, bias, pool, slots):
     batch, _, heads, key_dim = q.shape
     value_heads, value_dim = v.shape[2:]
     output = torch.empty_like(v)
-    _decode[(batch, value_heads, triton.cdiv(value_dim, 8))](
-        q, k, v, a, b, a_log, bias, pool, slots, output,
-        heads, value_heads, key_dim, value_dim, triton.next_power_of_2(key_dim), 8,
-        enable_fp_fusion=False)
+    # Deliberately retain the packed endpoint store: removing it changes
+    # compiler fusion and FP32 state bits, even when BF16 outputs agree.
+    # This transient scratch costs batch*HV*DV*DK*sizeof(state) bytes.
+    snapshots = torch.empty((batch, value_heads, value_dim, key_dim),
+                            dtype=pool.dtype, device=pool.device)
+    # Reuse the recurrent scan itself: matching BV/FMA alone still lets two
+    # separately compiled bodies fuse expressions differently.
+    _packed_recurrent[(batch, value_heads, triton.cdiv(value_dim, 32))](
+        q, k, v, a, b, a_log, bias, pool, slots,
+        _decode_offsets(batch, q.device), output, snapshots,
+        heads, value_heads, key_dim, value_dim, triton.next_power_of_2(key_dim), 32,
+        enable_fp_fusion=True, num_stages=3, num_warps=4)
     return output
 
 
@@ -153,9 +137,78 @@ def conv_endpoints(raw, pool, slots, cu_seqlens):
 
 
 @triton.jit
+def _conv_history(X, Pool, Slots, Cu, History, C: tl.constexpr,
+                  WIDTH: tl.constexpr, BC: tl.constexpr, BT: tl.constexpr):
+    req = tl.program_id(2)
+    start, end = tl.load(Cu+req), tl.load(Cu+req+1)
+    slot = tl.load(Slots+req)
+    t = tl.program_id(0)*BT+tl.arange(0, BT)
+    c = tl.program_id(1)*BC+tl.arange(0, BC)
+    mask = (t[:, None] < end-start+WIDTH) & (c[None, :] < C)
+    old = tl.load(Pool+(slot*C+c[None, :])*WIDTH+t[:, None],
+                  mask & (t[:, None] < WIDTH), other=0)
+    new = tl.load(X+(start+t[:, None]-WIDTH)*C+c[None, :],
+                  mask & (t[:, None] >= WIDTH), other=0)
+    tl.store(History+(start+req*WIDTH+t[:, None])*C+c[None, :],
+             tl.where(t[:, None] < WIDTH, old, new), mask)
+
+
+@triton.jit
+def _select_conv_history(History, Cu, Indices, Slots, Pool,
+                         N: tl.constexpr, C: tl.constexpr, WIDTH: tl.constexpr,
+                         BN: tl.constexpr, BC: tl.constexpr, BW: tl.constexpr):
+    row = tl.program_id(1)
+    endpoint = tl.load(Indices+row)
+    requests = tl.arange(0, BN)
+    ends = tl.load(Cu+requests+1, requests < N, other=2147483647)
+    req = tl.sum((endpoint >= ends).to(tl.int32), 0)
+    slot = tl.load(Slots+row)
+    c = tl.program_id(0)*BC+tl.arange(0, BC)
+    j = tl.arange(0, BW)
+    mask = (c[:, None] < C) & (j[None, :] < WIDTH)
+    value = tl.load(History+(endpoint+req*WIDTH+1+j[None, :])*C+c[:, None], mask, other=0)
+    tl.store(Pool+(slot*C+c[:, None])*WIDTH+j[None, :], value, mask)
+
+
+class ConvHistory:
+    """One initial history plus raw trial tokens per request; windows are views logically."""
+    def __init__(self, history, cu, width):
+        self.history, self.cu, self.width = history, cu, width
+
+    def commit(self, pool, slots, indices):
+        channels = self.history.shape[1]
+        requests = self.cu.numel()-1
+        _select_conv_history[(triton.cdiv(channels, 64), indices.numel())](
+            self.history, self.cu, indices, slots, pool, requests, channels,
+            self.width, triton.next_power_of_2(requests), 64,
+            triton.next_power_of_2(self.width))
+
+    def index_select(self, dim, indices):
+        if dim != 0:
+            raise ValueError('ConvHistory only supports endpoint selection')
+        result = torch.empty((indices.numel(), self.history.shape[1], self.width),
+                             dtype=self.history.dtype, device=self.history.device)
+        self.commit(result, torch.arange(indices.numel(), device=indices.device), indices)
+        return result
+
+    def __getitem__(self, index):
+        indices = torch.tensor([index], device=self.history.device)
+        return self.index_select(0, indices)[0]
+
+
+def compact_conv_endpoints(raw, pool, slots, cu_seqlens, max_len):
+    channels, width = pool.shape[1:]
+    history = torch.empty((raw.shape[0]+slots.numel()*width, channels),
+                          dtype=pool.dtype, device=pool.device)
+    _conv_history[(triton.cdiv(max_len+width, 4), triton.cdiv(channels, 128), slots.numel())](
+        raw, pool, slots, cu_seqlens, history, channels, width, 128, 4)
+    return ConvHistory(history, cu_seqlens, width)
+
+
+@triton.jit
 def _packed_recurrent(Q, Kptr, Vptr, A, Bptr, Log, Bias, Pool, Slots, Cu, Out, Snapshots,
                       HQ: tl.constexpr, HV: tl.constexpr, DK: tl.constexpr, DV: tl.constexpr,
-                      BK: tl.constexpr, BV: tl.constexpr):
+                      BK: tl.constexpr, BV: tl.constexpr, SAVE_STATES: tl.constexpr = True):
     batch, head = tl.program_id(0), tl.program_id(1)
     rows = tl.program_id(2)*BV+tl.arange(0, BV)
     cols = tl.arange(0, BK)
@@ -180,7 +233,8 @@ def _packed_recurrent(Q, Kptr, Vptr, A, Bptr, Log, Bias, Pool, Slots, Cu, Out, S
         v = tl.load(Vptr+(t*HV+head)*DV+rows, rows < DV, other=0).to(tl.float32)
         delta = (v-tl.sum(h*k[None, :], 1))*beta
         h = h+delta[:, None]*k[None, :]
-        tl.store(Snapshots+((t*HV+head)*DV+rows[:, None])*DK+cols[None, :], h, mask)
+        if SAVE_STATES:
+            tl.store(Snapshots+((t*HV+head)*DV+rows[:, None])*DK+cols[None, :], h, mask)
         y = tl.sum(h*q[None, :], 1)
         tl.store(Out+(t*HV+head)*DV+rows, y, rows < DV)
     tl.store(ptr, h, mask)

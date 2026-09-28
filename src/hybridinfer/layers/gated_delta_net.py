@@ -37,7 +37,7 @@ from torch import nn
 
 from hybridinfer.layers.layernorm import RMSNormGated
 from hybridinfer.layers.gdn_kernels import (packed_causal_conv, indexed_gdn_decode,
-                                           conv_endpoints, packed_gdn_recurrent)
+                                           compact_conv_endpoints, packed_gdn_recurrent)
 from hybridinfer.utils.context import get_context
 
 
@@ -349,7 +349,8 @@ class GatedDeltaNet(nn.Module):
                     and self.decode_backend == "pool")
         raw_qkv = self.in_proj_qkv(hidden_states).squeeze(1)
         out = packed_causal_conv(raw_qkv, self.conv1d.weight, self.conv_states,
-                                 idx, None, 1, decode=True).unsqueeze(1)
+                                 idx, None, 1, decode=True,
+                                 round_before_silu=False).unsqueeze(1)
 
         query, key, value = torch.split(
             out, [self.key_dim, self.key_dim, self.value_dim], dim=-1,
@@ -392,7 +393,8 @@ class GatedDeltaNet(nn.Module):
         raw, z, b, a = attention_pre
         ctx = get_context()
         if self.recurrent_states.dtype == torch.float32 and self.decode_backend == "pool":
-            conv = conv_endpoints(raw, self.conv_states, ctx.state_indices, ctx.cu_seqlens_q)
+            conv = compact_conv_endpoints(raw, self.conv_states, ctx.state_indices,
+                ctx.cu_seqlens_q, ctx.batch_descriptor.max_query_len)
             mixed = packed_causal_conv(raw, self.conv1d.weight, self.conv_states,
                 ctx.state_indices, ctx.cu_seqlens_q, ctx.batch_descriptor.max_query_len,
                 round_before_silu=False)

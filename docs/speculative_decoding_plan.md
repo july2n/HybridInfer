@@ -1,5 +1,11 @@
 # 投机解码实施计划
 
+**2026-09-28 验收调整（用户确认）：** 不再把完整 vLLM/普通 target 的逐位数值或
+greedy 序列一致性作为后续 backend 推进的硬门槛。状态选择、已提交历史、
+KV 有效范围、随机拒绝采样逻辑仍须正确；数值路径通过共同输入的概率偏差、
+argmax 翻转、客观任务质量及性能共同评估。先完成单候选 MTP（mtp-1）评估，
+可接受后推进后续适配。旧严格结果保留，不将失败记录改写为通过。
+
 **2026-09-28 目标更新：最终适配 EAGLE-3、P-EAGLE、DFlash、DFlash2、DSpark、MTP；n-gram 仅作为公共链路测试后端。** 新的固定 vLLM 新旧 runner 对齐检查、六种方法的独立特征/缓存/分布契约及实施顺序见 [vLLM 对齐审计](vllm_speculative_alignment.md)。后续按“公共 target recurrent 验证与状态选择 → 设备草稿/特征接口与拒绝 sampler → 本地真实 MTP → EAGLE-3/P-EAGLE → DFlash/DFlash2/DSpark”推进；不继续以 n-gram 性能优化作为最终交付。
 
 **最新实施：** 公共 recurrent target、原 trial 端点选择、设备特征/草稿接口、共享随机拒绝及真实 MTP 已接入；完整严格生成门槛尚未通过。详见 [本次实施与验收](speculative_mtp_implementation.md)。以下保留原阶段计划作为验收背景。

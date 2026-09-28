@@ -48,7 +48,7 @@ def packed_batch_forward(runner, seqs, batch, state_slots, *, project=True):
                 batch_descriptor=BatchDescriptor('spec_decode', len(inputs), len(seqs),
                                                  counts[0] if len(set(counts)) == 1 else None,
                                                  max(counts)))
-    endpoints = begin_endpoints(runner, len(inputs))
+    endpoints = begin_endpoints(runner, len(inputs), len(seqs))
     hidden = runner.model(make(inputs), make(positions))
     runner._trial_endpoints = endpoints
     proposer = getattr(runner, 'draft_proposer', None)
