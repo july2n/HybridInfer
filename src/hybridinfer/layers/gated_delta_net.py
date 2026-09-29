@@ -282,6 +282,8 @@ class GatedDeltaNet(nn.Module):
     ) -> torch.Tensor:
         raw_qkv_packed, z, b, a = attention_pre
         context = get_context()
+        if not context.is_prefill:
+            return self._forward_decode_dense(attention_pre)
         if context.prefill_slices is None or context.cu_seqlens_q is None:
             raise RuntimeError(
                 "GDN prefill requires packed slices and cu_seqlens"
@@ -334,10 +336,14 @@ class GatedDeltaNet(nn.Module):
         return self.out_proj(out)
 
     def _forward_decode(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Batched decode: all B sequences in ONE kernel launch per layer. Each
-        # row reads and writes its own persistent pool slot. The FP32 pool
-        # backend avoids gathering/scattering the recurrent matrix.
-        B = hidden_states.shape[0]
+        return self._forward_decode_dense(self.forward_dense_pre(hidden_states))
+
+    def _forward_decode_dense(self, attention_pre) -> torch.Tensor:
+        # Same stateful decode kernel for native and partitioned execution.
+        raw_qkv, z, b, a = attention_pre
+        B = raw_qkv.shape[0]
+        raw_qkv = raw_qkv.reshape(B, -1)
+        b, a = b.reshape(B, 1, -1), a.reshape(B, 1, -1)
         idx = get_context().state_indices
         if idx is None or idx.numel() == 0:
             raise RuntimeError(
@@ -347,7 +353,6 @@ class GatedDeltaNet(nn.Module):
         use_pool = (self.recurrent_states.dtype == torch.float32
                     and self.head_k_dim == 128 and self.head_v_dim == 128
                     and self.decode_backend == "pool")
-        raw_qkv = self.in_proj_qkv(hidden_states).squeeze(1)
         out = packed_causal_conv(raw_qkv, self.conv1d.weight, self.conv_states,
                                  idx, None, 1, decode=True,
                                  round_before_silu=False).unsqueeze(1)
@@ -359,9 +364,7 @@ class GatedDeltaNet(nn.Module):
         key = key.reshape(B, 1, -1, self.head_k_dim)
         value = value.reshape(B, 1, -1, self.head_v_dim)
 
-        z = self.in_proj_z(hidden_states).reshape(B, 1, -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)  # (B, 1, Hv)
-        a = self.in_proj_a(hidden_states)
+        z = z.reshape(B, 1, -1, self.head_v_dim)
         if self.gqa_ratio > 1 and not use_pool:
             query = query.repeat_interleave(self.gqa_ratio, dim=2)
             key = key.repeat_interleave(self.gqa_ratio, dim=2)

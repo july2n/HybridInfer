@@ -238,6 +238,8 @@ def make_runner(cfg, graphs=False):
     runner.async_output = True
     runner.model = ToyModel()
     runner.gdn_layers = []
+    from hybridinfer.engine.kv_cache_manager import KVCacheStorage
+    runner.kv_cache_manager = KVCacheStorage(cfg, runner.model, [])
     runner.sampler = Sampler()
     runner.output_copy_stream = torch.cuda.Stream()
     runner.sampled_token_ids_gpu = torch.empty(cfg.max_num_seqs, dtype=torch.int64, device='cuda')

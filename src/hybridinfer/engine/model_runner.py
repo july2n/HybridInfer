@@ -41,8 +41,6 @@ class ModelRunner:
         from hybridinfer.layers.gated_delta_net import GatedDeltaNet
         from hybridinfer.models.qwen3_5 import Qwen3_5ForCausalLM
 
-        if config.enable_piecewise_compile and not use_prefill_cudagraph:
-            raise ValueError("enable_piecewise_compile requires use_prefill_cudagraph=True")
         self._closed = False
         self.config = config
         hf_config = config.hf_config
@@ -287,16 +285,7 @@ class ModelRunner:
                                       positions, hidden, context.prefill_slices if is_prefill else None)
             return self.compute_logits(hidden, is_prefill)
 
-        if self.enforce_eager or not self.cuda_graphs.decode_graphs:
-            return self.compute_logits(self.model(input_ids, positions), is_prefill)
-
-        if mode == "prefill" and self.use_prefill_cudagraph:
-            return self.cuda_graphs.run_prefill(input_ids, positions)
-        if mode == "prefill":
-            return self.compute_logits(self.model(input_ids, positions), True)
-
-        # Ordinary decode dispatches through the graph manager.
-        return self.cuda_graphs.run_decode(input_ids, positions)
+        return self.cuda_graphs.run(input_ids, positions, is_prefill)
 
     def verify_speculative_batch(self, seqs, plans):
         from hybridinfer.spec_decode.batch_execution import verify_speculative_batch

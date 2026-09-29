@@ -79,3 +79,17 @@ PYTHONPATH=src python benchmarks/experiment_torch_compile.py
 局部性能。局部加速不代表端到端收益。实验及历史完整 forward 结果见
 [片段实验](../docs/torch_compile_experiment.md)和
 [完整 forward 实验](../docs/torch_compile_full_forward_experiment.md)。
+
+## Nested CUDA Graph wrapper
+
+默认 `cudagraph_mode=FULL_AND_PIECEWISE`：单 token decode 优先外层 FULL，
+prefill/mixed 使用内层 PIECEWISE。编译与图模式独立配置，详见
+[执行链与限制](../docs/piecewise_compilation.md)。
+
+```bash
+PYTHONPATH=src python benchmarks/validate_nested_graphs.py --compile-segments
+PYTHONPATH=src python benchmarks/validate_nested_graphs.py --compile-segments --mode NONE
+```
+
+该脚本在同一输入及 KV/GDN 初态下比较原始 eager 和选定图路径的 logits、
+概率与状态，并沿 eager 历史推进；仅作局部数值诊断。

@@ -333,7 +333,7 @@ class Qwen3_5DecoderLayer(nn.Module):
         """Eager attention core, ending just before the residual/MLP block."""
         if self.block_type == "linear_attention":
             output = self.linear_attn.forward_core_from_dense(attention_pre)
-            return output.squeeze(0)
+            return output.squeeze(0) if get_context().is_prefill else output.squeeze(1)
         return self.self_attn.forward_core_from_dense(
             attention_pre,
             positions,
