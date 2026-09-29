@@ -41,6 +41,8 @@ class ModelRunner:
         from hybridinfer.layers.gated_delta_net import GatedDeltaNet
         from hybridinfer.models.qwen3_5 import Qwen3_5ForCausalLM
 
+        if config.enable_piecewise_compile and not use_prefill_cudagraph:
+            raise ValueError("enable_piecewise_compile requires use_prefill_cudagraph=True")
         self._closed = False
         self.config = config
         hf_config = config.hf_config

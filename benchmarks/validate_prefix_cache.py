@@ -91,9 +91,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--model', default='models/Qwen3.5-0.8B')
     parser.add_argument('--graphs', action='store_true')
+    parser.add_argument('--compile-segments', action='store_true')
     parser.add_argument('--json-out', default='logs/validate/prefix_cache.json')
     args = parser.parse_args()
+    if args.compile_segments and not args.graphs:
+        parser.error('--compile-segments requires --graphs')
     engine = LLMEngine(args.model, enable_prefix_cache=True,
+                       enable_piecewise_compile=args.compile_segments,
                        prefix_cache_num_snapshots=2, max_num_seqs=3,
                        max_model_len=768, max_num_batched_tokens=256,
                        enforce_eager=not args.graphs, gpu_memory_utilization=.75)
@@ -120,7 +124,7 @@ def main():
     prefix = torch.randint(100, 10000, (512,), generator=generator).tolist()
     prompts = [prefix + [120 + i] * 17 for i in range(2)]
     params = SamplingParams(temperature=0, max_tokens=3, ignore_eos=True)
-    report = {'graphs': args.graphs, 'cases': {}}
+    report = {'graphs': args.graphs, 'compile_segments': args.compile_segments, 'cases': {}}
 
     def run(prompts):
         seqs = [Sequence(p, params) for p in prompts]

@@ -13,6 +13,7 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    enable_piecewise_compile: bool = False
     enable_prefix_cache: bool = False
     prefix_cache_num_snapshots: int = 8
     hf_config: AutoConfig | None = None
@@ -25,6 +26,8 @@ class Config:
     speculative: SpeculativeConfig | None = None
 
     def __post_init__(self):
+        if self.enable_piecewise_compile and self.enforce_eager:
+            raise ValueError("enable_piecewise_compile requires CUDA Graph execution (enforce_eager=False)")
         if self.speculative is not None and not isinstance(self.speculative, SpeculativeConfig):
             raise TypeError("speculative must be a SpeculativeConfig")
         if self.speculative and self.speculative.enabled and self.tensor_parallel_size != 1:

@@ -255,8 +255,14 @@ class CudaGraphManager:
                 if kind == "pre"
                 else layer.forward_output
             )
-            # Capture the production operators without compiler fusion, which
-            # can remove intermediate bf16 rounding and change greedy tokens.
+            if getattr(self.config, "enable_piecewise_compile", False):
+                # Compile before capture in the existing warmup. Dynamic token
+                # dimensions allow one callable to serve multiple graph buckets.
+                # The graph manager owns CUDA Graphs; Inductor must not nest them.
+                fn = torch.compile(
+                    fn, backend="inductor", fullgraph=True, dynamic=True,
+                    options={"triton.cudagraphs": False},
+                )
             self._piecewise_callables[cache_key] = fn
         return self._piecewise_callables[cache_key]
 

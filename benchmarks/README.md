@@ -65,3 +65,17 @@ MTP 验证与数值诊断默认从本地模型及公共自然输入生成 fixtur
 
 性能入口当前只支持 B1，MTP 要求 eager、关闭 prefix cache；B4 和普通 decode graph
 对照需扩展测量入口。下一步任务见 [实施计划](../docs/speculative_decoding_plan.md)。
+
+## 分段编译
+
+正式配置与数值限制见 [分段编译说明](../docs/piecewise_compilation.md)。
+
+```bash
+PYTHONPATH=src python benchmarks/validate_prefix_cache.py --graphs --compile-segments
+PYTHONPATH=src python benchmarks/experiment_torch_compile.py
+```
+
+前者验证正式路径的前缀缓存；后者测量静态片段的编译兼容性、数值偏差和
+局部性能。局部加速不代表端到端收益。实验及历史完整 forward 结果见
+[片段实验](../docs/torch_compile_experiment.md)和
+[完整 forward 实验](../docs/torch_compile_full_forward_experiment.md)。

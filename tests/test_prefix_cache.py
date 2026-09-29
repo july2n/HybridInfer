@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 
 from hybridinfer.engine.sequence import Sequence
-from hybridinfer.engine.block_manager import BlockManager
+from hybridinfer.engine.kv_cache_manager import BlockManager
 from hybridinfer.engine.prefix_checkpoint import PrefixCheckpointManager
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.scheduler import Scheduler

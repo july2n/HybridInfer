@@ -56,7 +56,7 @@ class SignatureTests(unittest.TestCase):
                 return hidden, residual
 
         layer = Layer()
-        manager = CudaGraphManager(SimpleNamespace())
+        manager = CudaGraphManager(SimpleNamespace(config=SimpleNamespace()))
         with patch("torch.compile", side_effect=AssertionError("changes bf16 rounding")):
             for kind, original in (("pre", layer.forward_piecewise_pre),
                                    ("post", layer.forward_output)):

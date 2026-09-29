@@ -3,7 +3,7 @@ import unittest
 import torch
 
 from hybridinfer.spec_decode.state import GDNTransaction
-from hybridinfer.engine.block_manager import BlockManager
+from hybridinfer.engine.kv_cache_manager import BlockManager
 from hybridinfer.engine.sequence import Sequence
 
 
