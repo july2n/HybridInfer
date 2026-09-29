@@ -192,20 +192,20 @@ class PrefixCacheTests(unittest.TestCase):
 
     def test_state_payload_restores_without_aliasing(self):
         import torch
-        from hybridinfer.engine.model_runner import ModelRunner
+        from hybridinfer.engine.kv_cache_manager import KVCacheStorage
 
         layers = [SimpleNamespace(conv_states=torch.randn(2, 6, 3),
                                   recurrent_states=torch.randn(2, 2, 4, 4))
                   for _ in range(2)]
-        runner = SimpleNamespace(config=SimpleNamespace(enable_prefix_cache=True,
-                                                         prefix_cache_num_snapshots=1),
-                                 gdn_layers=layers)
-        ModelRunner.allocate_prefix_snapshots(runner)
+        runner = KVCacheStorage(
+            SimpleNamespace(enable_prefix_cache=True, prefix_cache_num_snapshots=1,
+                            kvcache_block_size=4), None, layers)
+        runner.allocate_prefix_snapshots()
         a = self.seq([1])
         a.save_snapshot_id = 0
-        ModelRunner.copy_prefix_state(runner, a, 0, restore=False)
+        runner.copy_prefix_state(a, 0, restore=False)
         a.restore_snapshot_id = 0
-        ModelRunner.copy_prefix_state(runner, a, 1, restore=True)
+        runner.copy_prefix_state(a, 1, restore=True)
         for layer, (conv, recurrent) in zip(layers, runner.prefix_snapshots):
             self.assertTrue(torch.equal(layer.conv_states[1], conv[0]))
             self.assertTrue(torch.equal(layer.recurrent_states[1], recurrent[0]))

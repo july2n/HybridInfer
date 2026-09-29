@@ -15,6 +15,7 @@ from hybridinfer.utils.context import set_context, get_context, reset_context, B
 from hybridinfer.utils.loader import load_model
 from hybridinfer.utils.trace import trace_event
 
+from .kv_cache_manager import KVCacheStorage
 from .async_output import AsyncModelOutput
 from .request_state import InputBatch, RequestState
 from .staged_write import to_device
@@ -99,11 +100,12 @@ class ModelRunner:
         if config.speculative and config.speculative.enabled and config.speculative.method == "mtp":
             from hybridinfer.spec_decode.mtp import MTPProposer
             self.draft_proposer = MTPProposer(self)
-        self.allocate_gdn_state_pool()
-        self.allocate_prefix_snapshots()
+        self.kv_cache_manager = KVCacheStorage(config, self.model, self.gdn_layers)
+        self.kv_cache_manager.allocate_gdn_state_pool()
+        self.kv_cache_manager.allocate_prefix_snapshots()
         self.warmup_model()
         self.input_batch.clear()
-        self.allocate_kv_cache()
+        self.kv_cache_manager.allocate_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -138,6 +140,7 @@ class ModelRunner:
         self.draft_proposer = None
         self._trial_endpoints = {}
         self.cuda_graphs.clear()
+        self.kv_cache_manager.clear()
         for name in ("gdn_layers",):
             value = getattr(self, name, None)
             if value is not None:
@@ -145,8 +148,6 @@ class ModelRunner:
         if hasattr(self, "input_batch"):
             self.input_batch.clear()
         self.model = None
-        self.kv_cache = None
-        self.prefix_snapshots = []
         self.sampled_token_ids_gpu = None
         self.batch_slots_gpu = None
         self.request_state = None
@@ -205,82 +206,6 @@ class ModelRunner:
         if async_output is not None:
             async_output.get_output()
         torch.cuda.empty_cache()
-
-    def allocate_kv_cache(self):
-        config = self.config
-        hf_config = config.hf_config
-        free, total = torch.cuda.mem_get_info()
-        used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-
-        # Only full_attention layers hold K/V cache; GDN layers keep their own
-        # conv/recurrent state pools instead. Count cache-bearing modules from
-        # the model structure (robust to both ``layer_types`` and the
-        # ``full_attention_interval`` fallback, and to Dense checkpoints where
-        # every layer is attention).
-        num_attn_layers = sum(
-            1 for module in self.model.modules()
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache")
-        )
-        assert num_attn_layers > 0, "no attention layers found; cannot size KV cache"
-        block_bytes = (
-            2 * num_attn_layers
-            * self.block_size
-            * num_kv_heads
-            * head_dim
-            * hf_config.dtype.itemsize
-        )
-        snapshot_reserve = (config.speculative.state_snapshot_budget_mb*1024**2
-                            if config.speculative and config.speculative.enabled else 0)
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current
-                                       - snapshot_reserve) // block_bytes
-        if config.num_kvcache_blocks <= 0:
-            raise ValueError("GPU memory budget cannot fit target KV after state snapshot reserve; "
-                             "reduce state_snapshot_budget_mb or request capacity")
-        self.kv_cache = torch.empty(
-            2, num_attn_layers, config.num_kvcache_blocks,
-            self.block_size, num_kv_heads, head_dim,
-        )
-        layer_id = 0
-        for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
-        assert layer_id == num_attn_layers, (
-            f"attention layer drift: assigned {layer_id} caches but sized "
-            f"for {num_attn_layers}"
-        )
-
-    def allocate_gdn_state_pool(self):
-        num_slots = self.config.max_num_seqs
-        speculative = self.config.speculative
-        if speculative and speculative.enabled:
-            num_slots *= 2  # One private trial slot per active verification request.
-        for layer in self.gdn_layers:
-            layer.allocate_state_pool(num_slots)
-
-    def allocate_prefix_snapshots(self):
-        count = self.config.prefix_cache_num_snapshots if self.config.enable_prefix_cache else 0
-        self.prefix_snapshots = [
-            (layer.conv_states.new_empty((count, *layer.conv_states.shape[1:])),
-             layer.recurrent_states.new_empty((count, *layer.recurrent_states.shape[1:])))
-            for layer in self.gdn_layers
-        ]
-
-    def copy_prefix_state(self, seq, slot, restore):
-        snapshot_id = seq.restore_snapshot_id if restore else seq.save_snapshot_id
-        if snapshot_id is None:
-            return
-        for layer, (conv, recurrent) in zip(self.gdn_layers, self.prefix_snapshots):
-            for runtime, cached in ((layer.conv_states, conv), (layer.recurrent_states, recurrent)):
-                if restore:
-                    runtime[slot].copy_(cached[snapshot_id])
-                else:
-                    cached[snapshot_id].copy_(runtime[slot])
 
     def prepare_inputs(self, seqs: list[Sequence], is_prefill: bool):
         counts_cpu = [seq.num_scheduled_tokens for seq in seqs]
@@ -393,14 +318,7 @@ class ModelRunner:
         slots_t = to_device(slots, torch.int64, self.batch_slots_gpu.device)
         self.batch_slots_gpu[:len(seqs)].copy_(slots_t)
 
-        if new_entries and self.gdn_layers:
-            new_slots = to_device(
-                [slot for _, slot in new_entries], torch.int64, self.batch_slots_gpu.device,
-            )
-            for layer in self.gdn_layers:
-                layer.reset_state(new_slots)
-            for seq, slot in new_entries:
-                self.copy_prefix_state(seq, slot, restore=True)
+        self.kv_cache_manager.prepare_requests(new_entries, self.batch_slots_gpu.device)
 
         with trace_event(
             "prepare_inputs", "runner",
@@ -416,8 +334,7 @@ class ModelRunner:
                 positions,
                 is_prefill,
             )
-        for seq, slot in zip(seqs, slots):
-            self.copy_prefix_state(seq, slot, restore=False)
+        self.kv_cache_manager.save_requests(seqs, slots)
         advance(self.request_state, self.batch_slots_gpu[:len(seqs)], self._step_counts)
         self._pending = (logits, temperatures, seqs, is_prefill)
         return None
@@ -520,3 +437,11 @@ class ModelRunner:
     @property
     def prefill_piecewise_graphs(self):
         return self.cuda_graphs.prefill_graphs
+
+    @property
+    def kv_cache(self):
+        return self.kv_cache_manager.kv_cache
+
+    @property
+    def prefix_snapshots(self):
+        return self.kv_cache_manager.prefix_snapshots

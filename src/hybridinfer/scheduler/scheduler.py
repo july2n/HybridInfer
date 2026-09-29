@@ -2,8 +2,7 @@ from collections import deque
 
 from hybridinfer.config import Config
 from hybridinfer.engine.sequence import Sequence, SequenceStatus
-from hybridinfer.engine.block_manager import BlockManager
-from hybridinfer.engine.prefix_checkpoint import PrefixCheckpointManager
+from hybridinfer.engine.kv_cache_manager import KVCacheManager
 
 
 class Scheduler:
@@ -20,9 +19,7 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.enable_prefix_cache = config.enable_prefix_cache
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
-        self.checkpoints = (PrefixCheckpointManager(getattr(config, "prefix_cache_num_snapshots", 8))
-                            if self.enable_prefix_cache and getattr(config, "is_hybrid", False) else None)
+        self.kv_cache_manager = KVCacheManager(config)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         # MRV2 zombie equivalent: seqs dispatched to execute_model but not yet
@@ -75,9 +72,9 @@ class Scheduler:
             return fallback("no_draft_or_budget")
         original_counts = {seq.seq_id: len(seq.block_table) for seq in seqs}
         for seq, plan in zip(seqs, plans):
-            if not self.block_manager.reserve_trial(seq, plan.trial_end):
+            if not self.kv_cache_manager.reserve_trial(seq, plan.trial_end):
                 for reserved in seqs:
-                    self.block_manager.trim_trial(reserved, original_counts[reserved.seq_id]*self.block_size)
+                    self.kv_cache_manager.trim_trial(reserved, original_counts[reserved.seq_id]*self.block_size)
                 return fallback("kv_capacity_or_shared_tail")
         self._spec_trial_block_counts.update(original_counts)
         for seq in seqs:
@@ -88,7 +85,7 @@ class Scheduler:
     def abort_speculative_batch(self, seqs):
         for seq in reversed(seqs):
             original = self._spec_trial_block_counts.pop(seq.seq_id)
-            self.block_manager.trim_trial(seq, original*self.block_size)
+            self.kv_cache_manager.trim_trial(seq, original*self.block_size)
             self.in_flight.discard(seq.seq_id)
             self.running.appendleft(seq)
 
@@ -98,16 +95,15 @@ class Scheduler:
         self._spec_trial_block_counts.pop(seq.seq_id, None)
         seq.append_tokens(result.token_ids)
         seq.num_scheduled_tokens = result.committed_computed_length - seq.num_cached_tokens
-        self.block_manager.trim_trial(seq, result.committed_computed_length)
-        if self.enable_prefix_cache:
-            self.block_manager.hash_blocks(seq)
+        self.kv_cache_manager.trim_trial(seq, result.committed_computed_length)
+        self.kv_cache_manager.cache_blocks(seq)
         seq.num_cached_tokens = result.committed_computed_length
         seq.num_scheduled_tokens = 0
         self.in_flight.remove(seq.seq_id)
         if result.finished:
             seq.status = SequenceStatus.FINISHED
             self.resident.discard(seq.seq_id)
-            self.block_manager.deallocate(seq)
+            self.kv_cache_manager.free(seq)
         else:
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
@@ -150,14 +146,10 @@ class Scheduler:
                 # free-block admission check; skipping it when prefix caching
                 # is disabled let allocate() pop from an empty deque once the
                 # KV pool was exhausted (benchmark bs=112 crash).
-                cached = self.block_manager.find_cached_blocks(seq) if self.enable_prefix_cache else 0
-                snapshot_id = None
-                if self.checkpoints:
-                    cached, snapshot_id = self.checkpoints.lookup(seq, cached)
-                num_cached_blocks = self.block_manager.can_allocate(seq, cached)
+                cached = self.kv_cache_manager.get_computed_blocks(seq)
+                num_cached_blocks = self.kv_cache_manager.can_allocate(seq, cached)
                 if num_cached_blocks == -1:
-                    if snapshot_id is not None:
-                        self.checkpoints.release(snapshot_id)
+                    self.kv_cache_manager.release_reader(seq)
                     if not scheduled_seqs and not self.running and not self.in_flight:
                         raise RuntimeError(
                             "KV cache exhausted before admission: "
@@ -165,33 +157,17 @@ class Scheduler:
                             f"have {len(self.block_manager.free_block_ids)} free"
                         )
                     break
-                seq.restore_snapshot_id = snapshot_id
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
-                if seq.restore_snapshot_id is not None:
-                    self.checkpoints.release(seq.restore_snapshot_id)
-                    seq.restore_snapshot_id = None
+                self.kv_cache_manager.release_reader(seq)
                 break
             if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
+                self.kv_cache_manager.allocate_slots(seq, num_cached_blocks)
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             seq.is_prefill = True
-            if self.checkpoints:
-                start = seq.num_cached_tokens
-                end = start + seq.num_scheduled_tokens
-                boundary = (seq.num_tokens - 1) // self.block_size * self.block_size
-                if start < boundary < end:
-                    end = boundary
-                elif end < seq.num_tokens and end // self.block_size * self.block_size > start:
-                    end = end // self.block_size * self.block_size
-                if end % self.block_size == 0:
-                    seq.save_snapshot_id = self.checkpoints.reserve(seq, end)
-                    # Only split for a checkpoint we can actually save. A full
-                    # pinned pool or an existing entry needs no extra forward.
-                    if seq.save_snapshot_id is not None:
-                        seq.num_scheduled_tokens = end - start
+            self.kv_cache_manager.plan_prefill(seq)
             num_batched_tokens += seq.num_scheduled_tokens
             self.waiting.popleft()
             self.in_flight.add(seq.seq_id)
@@ -207,7 +183,7 @@ class Scheduler:
             if remaining <= 0:
                 break
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.kv_cache_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -216,7 +192,7 @@ class Scheduler:
             else:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
-                self.block_manager.may_append(seq)
+                self.kv_cache_manager.append_slots(seq)
                 self.in_flight.add(seq.seq_id)
                 scheduled_seqs.append(seq)
                 num_batched_tokens += 1
@@ -234,23 +210,13 @@ class Scheduler:
         self.in_flight.discard(seq.seq_id)
         self.resident.discard(seq.seq_id)
         self.preempted.append(seq.seq_id)
-        self.block_manager.deallocate(seq)
+        self.kv_cache_manager.free(seq)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
         for seq, token_id in zip(seqs, token_ids):
             self.in_flight.discard(seq.seq_id)  # sample consumed, seq schedulable again
-            if self.enable_prefix_cache:
-                self.block_manager.hash_blocks(seq)
-            if self.checkpoints:
-                if seq.restore_snapshot_id is not None:
-                    self.checkpoints.hits += 1
-                    self.checkpoints.hit_tokens += seq.num_cached_tokens
-                    self.checkpoints.release(seq.restore_snapshot_id)
-                    seq.restore_snapshot_id = None
-                if seq.save_snapshot_id is not None:
-                    self.checkpoints.release(seq.save_snapshot_id, publish=True)
-                    seq.save_snapshot_id = None
+            self.kv_cache_manager.complete(seq)
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
@@ -262,7 +228,15 @@ class Scheduler:
                     or seq.num_cached_tokens >= self.max_model_len):
                 seq.status = SequenceStatus.FINISHED
                 self.resident.discard(seq.seq_id)
-                self.block_manager.deallocate(seq)
+                self.kv_cache_manager.free(seq)
             else:
                 seq.status = SequenceStatus.RUNNING
                 self.running.append(seq)  # back to schedulable
+
+    @property
+    def block_manager(self):
+        return self.kv_cache_manager.block_pool
+
+    @property
+    def checkpoints(self):
+        return self.kv_cache_manager.checkpoints

@@ -100,7 +100,7 @@ def main():
     sampler = CaptureSampler()
     engine.model_runner.sampler = sampler
     sampler.runner = engine.model_runner
-    original_copy = engine.model_runner.copy_prefix_state
+    original_copy = engine.model_runner.kv_cache_manager.copy_prefix_state
     copies = {'restore': 0, 'save': 0}
 
     def checked_copy(seq, slot, restore):
@@ -114,7 +114,7 @@ def main():
             assert torch.equal(layer.recurrent_states[slot], recurrent[snapshot_id])
         copies['restore' if restore else 'save'] += 1
 
-    engine.model_runner.copy_prefix_state = checked_copy
+    engine.model_runner.kv_cache_manager.copy_prefix_state = checked_copy
     pool = engine.scheduler.checkpoints
     generator = torch.Generator().manual_seed(91)
     prefix = torch.randint(100, 10000, (512,), generator=generator).tolist()
