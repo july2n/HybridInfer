@@ -1,6 +1,6 @@
 # 投机解码当前进度
 
-更新：2026-09-29。验收目标是数学语义、原 trial 端点选择和数值/质量控制。
+更新：2026-09-30。验收目标是数学语义、原 trial 端点选择和数值/质量控制。
 跨浮点路径的 greedy 序列相同率仅作诊断。下一阶段建议集中于 MTP 性能测量和优化。
 
 ## 已实现
@@ -13,6 +13,7 @@
 - 独立异步输出句柄、完成事件、KV 容量预留/回收、异常事务恢复与资源不足回退。
 - 设备草稿与目标特征接口；真实 MTP 权重、独立 draft KV、特征历史和结束/抢占释放。
   当前 MTP 逐请求、逐候选生成草稿，支持默认 greedy 点质量 q 与可选 random 概率 q；支持混合 greedy/random target 请求。
+- EAGLE-3 线性草稿协议适配；DFlash 与 DSpark 真实 Qwen3.5-2B 草稿权重、块上下文私有 KV 和 greedy 候选生成。
 
 投机默认关闭，开启后默认 `packed_guarded`：试算 packed 后提交普通 batch 形状的
 单步 anchor，候选接受数为零，不承诺加速。显式 `packed` 执行多词元接受；
@@ -45,7 +46,7 @@ K=4 为 1.040，后者接受率降至 28.4%。最佳 K 随负载变化。
 
 性能入口目前只支持 B1；MTP 强制 eager、关闭 prefix cache。
 批量 proposer、投机图执行、MTP prefix 协作、自适应 K 尚未实现。
-EAGLE-3 已接入初始线性草稿架构与验证链路，尚缺与本地 target 配套训练的权重验收；P-EAGLE、DFlash、DFlash2、DSpark 尚未实现。
+EAGLE-3 尚缺与本地 target 配套训练的权重验收；P-EAGLE 和 DFlash2 尚未实现。
 
 ## 下一步建议
 
@@ -71,3 +72,9 @@ B4 与图路径对照需先扩展测量入口。质量和复杂系统覆盖伴�
 概率草稿的 B1、temperature=0.8、K=1/2/4 配对性能测量已完成，见 [测量报告](mtp_random_evaluation.md)。长记录 K=4 decode 耗时比为 1.849，中文各 K 无收益；未与普通 FULL 图对照，不改变默认配置。
 
 EAGLE-3 初始适配与协议夹具结果见 [实现说明](eagle3_implementation.md)。真实 target + 未训练草稿的 410 次端点检查零失败，不构成训练权重的质量/性能验收。
+
+## DFlash / DSpark 真实权重（2026-09-30）
+
+Qwen3.5-2B、RTX 3060 Ti、B1 eager：DFlash `packed` 25 轮、70 个候选、接受 25 个、42 次原 trial 端点检查零失败；DSpark `packed` 25 轮、86 个候选、接受 28 个、44 次端点检查零失败。这组自由生成均与 eager target 一致。DSpark B2 的 127 次端点检查零失败，但仓库代码输入的两个请求在第 11 个输出 token 与独立 eager 轨迹不同。
+
+B1 配对性能中，长记录的 DFlash K=8 为 2.91×、DSpark K=4 为 2.36×，DSpark 中文 K=4 为 0.84×；比值为普通 eager / 投机 decode 耗时。不同输入的接受率和轨迹差异见 [完整测量](block_draft_implementation.md)。不能把局部端点通过或个别加速比推广到通用质量与吞吐。

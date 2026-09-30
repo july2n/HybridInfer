@@ -1,6 +1,6 @@
 # 投机解码实施计划
 
-更新：2026-09-29。目标是数学语义一致、正确选择原 trial 端点、控制数值误差，
+更新：2026-09-30。目标是数学语义一致、正确选择原 trial 端点、控制数值误差，
 并通过实测建立性能收益。跨浮点路径的逐位或 greedy 全序列一致性作为诊断指标。
 预测行、端点、历史范围、EOS/长度与采样算法仍严格验收。
 
@@ -16,7 +16,7 @@
 MTP 当前要求 eager、关闭 prefix cache，使用单个预测层、共享 embedding/head、
 独立 draft KV 和 target feature 历史。MTP 支持 greedy 点质量与可选概率草稿，可服务随机 target。
 当前不混合 prefill 与投机验证。树候选需独立 mask、位置和 GDN 分支状态。
-最终草稿范围为 MTP、EAGLE-3、P-EAGLE、DFlash、DFlash2、DSpark；EAGLE-3 初始线性架构已接入，尚缺配套训练权重验收；后四种尚未实现。
+草稿范围为 MTP、EAGLE-3、P-EAGLE、DFlash、DFlash2、DSpark；EAGLE-3 初始线性架构已接入，尚缺配套训练权重验收；DFlash/DSpark 已接入真实 Qwen3.5-2B 权重并完成 B1 验证与性能测量；P-EAGLE、DFlash2 尚未实现。结果见 [块草稿说明](block_draft_implementation.md)。
 
 ## 2. 公共架构
 
@@ -24,12 +24,12 @@ MTP 当前要求 eager、关闭 prefix cache，使用单个预测层、共享 em
 |---|---|
 | `config.py`、`interfaces.py` | 方法、候选上限、预算、CPU/设备草稿与后端能力 |
 | `metadata.py` | 变长累计长度、hidden/logits 两套行索引 |
-| `batch_execution.py` | 一次 target 前向、试算与原 trial 端点提交 |
-| `batch_verifier.py`、`rejection.py` | GPU 接受、补偿/bonus 与停止条件 |
-| `state.py`、`endpoints.py` | 状态事务、共享 conv 历史与 recurrent 端点 |
-| `commit.py`、`async_output.py` | 有效历史/长度提交、输出缓冲区及完成事件 |
+| `engine/spec_verification/batch_execution.py` | 一次 target 前向、试算与原 trial 端点提交 |
+| `sampling/batch_verifier.py`、`sampling/rejection_sampler.py` | GPU 接受、补偿/bonus 与停止条件 |
+| `engine/spec_verification/{state,endpoints}.py` | 状态事务、共享 conv 历史与 recurrent 端点 |
+| `engine/spec_verification/{commit,async_output}.py` | 有效历史/长度提交、输出缓冲区及完成事件 |
 | `spec_decode/mtp.py`、`models/qwen3_5_mtp.py` | 特征历史、draft KV、真实模型与权重 |
-| `ngram.py`、`verifier.py` | 历史匹配草稿和 CPU 接受参考 |
+| `spec_decode/ngram.py`、`sampling/greedy_reference.py` | 历史匹配草稿和 CPU 接受参考 |
 
 设备候选在调度适配边界仍转为 CPU tuple，当前不是全设备调度。
 所有请求共用 `verify_speculative_batch`；指标由 runner/scheduler 记录。
@@ -125,9 +125,9 @@ Conv 保存初始历史加 trial raw tokens，按端点选择历史窗口；recu
 
 ## 5. 下一阶段建议：MTP 性能与覆盖
 
-以下任务尚未实施，按测量结果调整优化优先级：
+其中 B1 的五类自然输入 K=1/2/4 概率 MTP 配对测量已完成，结果见 [概率 MTP 评估](mtp_random_evaluation.md)；以下保留尚缺的覆盖和优化任务：
 
-1. **完整候选扫描与耗时分解。** 五类自然输入，K=1/2/4、B1/B4，固定模型、
+1. **B4 候选扫描与耗时分解。** 五类自然输入，K=1/2/4、B1/B4，固定模型、
    精度、输入、输出预算、采样与缓存条件；配对轮换并增加重复次数。
    记录实际 K_i、每轮有效输出、接受率、proposer/target/状态提交时间、CPU 同步、
    峰值显存与回退。当前性能脚本只支持 B1，B4 需扩展入口。

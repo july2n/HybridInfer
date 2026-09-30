@@ -2,7 +2,7 @@
 
 本文解释 `hybridinfer` 当前的 Model Runner V2（简称 MRV2）实现。重点是请求状态如何保存、每轮输入如何生成、模型与采样如何衔接，以及异步执行为什么不会破坏请求状态。文中的类名、字段名和执行路径均对应本仓库代码。
 
-**当前项目已经实现 MRV2 的核心执行机制，但尚未与 vLLM MRV2 的完整功能对齐。** 支持范围是现有的 Qwen3.5 文本推理路径；同一请求的乐观异步调度、推测解码、多模态、LoRA 等能力不在当前实现中。执行架构参考 [vLLM 官方 MRV2 设计文档](https://github.com/vllm-project/vllm/blob/main/docs/design/model_runner_v2.md)，下文对本项目细节的解释以本地代码为准。
+**当前项目已经实现 MRV2 的核心执行机制，但尚未与 vLLM MRV2 的完整功能对齐。** 支持范围是现有的 Qwen3.5 文本推理路径；投机解码已接入，同一请求的乐观异步调度、多模态、LoRA 等能力仍不在当前实现中。投机链路另见 [实现进度](speculative_decoding_progress.md)。执行架构参考 [vLLM 官方 MRV2 设计文档](https://github.com/vllm-project/vllm/blob/main/docs/design/model_runner_v2.md)，下文对本项目细节的解释以本地代码为准。
 
 建议先阅读第 1～4 节建立整体认识，再通过第 5～8 节跟踪一次实际执行。第 9～13 节解释调度、CUDA Graph、TP 和状态回收；最后几节列出验证方法与实现边界。
 
@@ -917,7 +917,7 @@ random_sampling = SamplingParams(
 | TP 请求和 token 同步                           | 已接入             | 真实多 GPU NCCL 验证尚未完成                           |
 | hybrid prefix cache                            | 已实现，可选开启   | 联合 KV 与 GDN 块边界快照，详见 prefix_caching.md       |
 | UVA prompt 访问                                | 未实现             | 当前用 pinned H2D 与 GPU token 存储                    |
-| 推测解码 / MTP                                 | 未实现             | 类型与路由预留不等于功能支持                           |
+| 推测解码 / MTP                                 | 已实现             | 独立验证与草稿链路见 speculative_decoding_progress.md  |
 | 通用`ModelState` 模型插件接口                | 未实现             | 仍围绕 Qwen3.5 的模型路径组织                          |
 | 多模态、LoRA、prompt/top-k logprobs、penalties | 未实现             | 不属于当前文本推理 API 的支持范围                      |
 

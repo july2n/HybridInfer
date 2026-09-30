@@ -65,7 +65,7 @@ MTP-1 表示每轮最多一个候选，target 验证 anchor + candidate。
 | low_match | 1.030 | 1.082 | 1.040 |
 
 候选越多不一定越快：low_match 的 K=4 接受率降至 28.4%，收益低于 K=2。
-下一步建议先补五类输入 K=1/2/4 与 B1/B4 扫描、分项测量及普通 decode graph
+五类输入 K=1/2/4 的 B1 概率与 greedy MTP 扫描已在后续实验完成，见 [概率 MTP 评估](mtp_random_evaluation.md)。下一步仍需 B4 扫描、分项测量及普通 decode graph
 对照，再根据成本优化批量 proposer、图执行和候选长度选择。当前性能脚本仅支持
 B1，MTP 配置强制 eager，B4 与图路径对照需扩展入口。完整任务见
 [实施计划](speculative_decoding_plan.md)。当前不统一将候选数设为 4。

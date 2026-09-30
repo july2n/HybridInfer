@@ -32,3 +32,9 @@ device-only drafts earlier in the runner's sampling stage.
 `SpecDecodeBaseProposer`; block models override candidate generation while
 EAGLE and block models enable target intermediate-feature capture. The
 `Eagle3Proposer` name remains an alias for existing callers.
+
+`BlockProposer` selects `DFlashDraft` or `DSparkDraft`. Both share block context
+KV handling; feature layer selection, candidate heads, vocabulary mapping, and
+checkpoint validation belong to the selected model class. Real Qwen3.5-2B
+checkpoint validation and B1 performance measurements are documented in
+[`docs/block_draft_implementation.md`](../../../docs/block_draft_implementation.md).

@@ -1,6 +1,6 @@
 # vLLM 参考与模型草稿适配契约
 
-更新：2026-09-29。当前公共链路与真实 MTP 已实现；后续适配共用 target 验证和状态提交，
+更新：2026-09-30。当前公共链路、真实 MTP 与 Qwen3.5-2B DFlash/DSpark 已实现；各草稿适配共用 target 验证和状态提交，
 各草稿模型的特征、查询布局、缓存与实际 q 分别实现。
 
 ## 参考范围
@@ -62,5 +62,4 @@ Native target 使用多词元 recurrent 验证，保存原 trial 端点，部分
 ## 推进顺序
 
 先完成 [MTP 性能与覆盖计划](speculative_decoding_plan.md)，
-随后选择兼容 checkpoint，推进 EAGLE-3/P-EAGLE，再适配 DFlash/DFlash2/DSpark。
-当前配置只支持 `ngram` 和 `mtp`；后五种方法均未实现。
+EAGLE-3 已完成线性协议适配，仍需配套训练权重；DFlash/DSpark 已接入真实 Qwen3.5-2B checkpoint，结果见 [块草稿说明](block_draft_implementation.md)。P-EAGLE 和 DFlash2 仍待实现。当前配置支持 `ngram`、`mtp`、`eagle3`、`dflash`、`dspark`。

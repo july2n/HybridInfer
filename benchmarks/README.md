@@ -63,7 +63,7 @@ MTP 验证与数值诊断默认从本地模型及公共自然输入生成 fixtur
 输出不同仍提供 `measured_decode_time_ratio`，不能把它当成相同轨迹的加速证明。
 小样本质量 smoke 不能证明通用质量无损。
 
-性能入口当前只支持 B1，MTP 要求 eager、关闭 prefix cache；B4 和普通 decode graph
+性能入口当前只支持 B1；模型草稿要求 eager、关闭 prefix cache。B4 和普通 decode graph
 对照需扩展测量入口。下一步任务见 [实施计划](../docs/speculative_decoding_plan.md)。
 
 ## 分段编译
@@ -144,4 +144,23 @@ PYTHONPATH=src conda run --no-capture-output -n vllm_env python benchmarks/bench
 
 ## DFlash / DSpark
 
-Qwen3.5-2B 公开草稿权重的下载、运行范围、验证命令见 [块草稿适配](../docs/block_draft_implementation.md)。
+Qwen3.5-2B 公开草稿权重的下载、运行范围、验证结果和完整五类输入性能表见 [块草稿适配](../docs/block_draft_implementation.md)。测量入口示例：
+
+```bash
+PYTHONPATH=src:.runtime-deps conda run --no-capture-output -n vllm_env \
+  python benchmarks/bench_spec_decode.py --model models/Qwen3.5-2B \
+  --method dflash --draft-model models/Qwen3.5-2B-DFlash \
+  --enforce-eager --suite natural --draft-sweep 3 8 \
+  --modes baseline packed --prompt-tokens 128 --output-tokens 64 \
+  --warmups 1 --repeats 3 --json-out logs/bench/dflash_2b_real.json
+
+PYTHONPATH=src:.runtime-deps conda run --no-capture-output -n vllm_env \
+  python benchmarks/bench_spec_decode.py --model models/Qwen3.5-2B \
+  --method dspark --draft-model models/Qwen3.5-2B-DSpark \
+  --enforce-eager --suite natural --draft-sweep 2 4 \
+  --modes baseline packed --prompt-tokens 128 --output-tokens 64 \
+  --warmups 1 --repeats 3 --gpu-memory-utilization .98 \
+  --state-snapshot-budget-mb 128 --json-out logs/bench/dspark_2b_real.json
+```
+
+本地实测中 DFlash 的长记录 K=8 为 2.91×，DSpark 的长记录 K=4 为 2.36×；DSpark 中文 K=4 为 0.84×。比值是 baseline / 投机 decode 耗时，输入与输出差异见上述文档；这些结果不代表所有请求都有收益。日志目录被 Git 忽略，复现时请保留生成的 JSON。

@@ -65,7 +65,7 @@ finally:
 
 MTP 限于单 GPU、单个预测层、共享 embedding/head、eager、关闭 prefix cache，
 不满足配置明确报错。批量 proposer、投机图执行、MTP prefix 协作尚未实现。
-EAGLE-3 的初始线性适配见 [实现说明](eagle3_implementation.md)；P-EAGLE、DFlash/DFlash2/DSpark 尚未实现，不会静默退回 n-gram。
+EAGLE-3 的初始线性适配见 [实现说明](eagle3_implementation.md)；DFlash/DSpark 的真实权重适配与 B1 实测见 [块草稿说明](block_draft_implementation.md)。P-EAGLE、DFlash2 尚未实现，不会静默退回 n-gram。
 
 ## 概率 MTP 使用示例
 

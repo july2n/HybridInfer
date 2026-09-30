@@ -12,20 +12,32 @@ HybridInfer 是一个面向混合注意力模型的轻量级大语言模型推�
 - **历史与前缀缓存**：全注意力采用分页键值缓存，Gated DeltaNet 使用请求级状态池；通过块对齐的状态快照联合复用两类历史，支持并发读取与缓存淘汰。前缀缓存默认关闭，可按需启用。
 - **CUDA Graph**：解码采用完整模型图，预填充按词元数量分桶捕获静态投影、归一化和前馈网络，动态注意力核心保持普通执行；复用层间缓冲区与图内存池。
 - **Triton 算子**：直接处理变长请求的打包卷积，按请求槽位原地读写 FP32 递归状态，减少填充、拼接及状态搬运；普通与分段预填充共用核心实现。
+- **投机解码**：支持 n-gram、Qwen3.5 MTP、EAGLE-3、DFlash 和 DSpark 草稿。
 
 ## 实测性能
 
 测试环境为 **RTX 3060 Ti、Qwen3.5-0.8B、BF16 计算、FP32 递归状态**，开启解码图和分段预填充图。以下为各测试场景多次运行后的中位耗时：
 
-| 场景 | 耗时 |
-|---|---:|
-| 单请求，512 个输入词元 | 36.85 毫秒 |
-| 4 个请求，各 128 个输入词元 | 36.90 毫秒 |
-| 变长预填充，总计 480 个输入词元 | 37.60 毫秒 |
-| 分块变长预填充，总计 960 个输入词元 | 71.90 毫秒 |
+| 场景                                       |       耗时 |
+| ------------------------------------------ | ---------: |
+| 单请求，512 个输入词元                     | 36.85 毫秒 |
+| 4 个请求，各 128 个输入词元                | 36.90 毫秒 |
+| 变长预填充，总计 480 个输入词元            | 37.60 毫秒 |
+| 分块变长预填充，总计 960 个输入词元        | 71.90 毫秒 |
 | 7 个解码请求与延后到达的预填充请求混合执行 | 90.70 毫秒 |
 
 纯预填充每项测量 10 次，混合负载测量 3 次；混合项为整段负载耗时。这些结果不是在线服务的首词元延迟或逐词元延迟，也未与外部框架进行同条件性能对照。完整配置、复现命令和算子测量见 [GDN 内核优化记录](docs/gdn_kernel_optimization.md)。
+
+真实 Qwen3.5-2B 草稿另在 RTX 3060 Ti、单请求、双方 eager、greedy、64 输出 token、每模式预热 1 次并测量 3 次的配对实验中测试。下表是普通 decode 耗时 / `packed` decode 耗时中位数；大于 1 表示本轮投机路径更快：
+
+| 草稿   | K | 长记录 | 仓库代码 | 中文自然语言 |
+| ------ | -: | -----: | -------: | -----------: |
+| DFlash | 3 | 1.63× |   1.17× |       1.02× |
+| DFlash | 8 | 2.91× |   2.44× |       1.06× |
+| DSpark | 2 | 1.53× |   1.30× |       0.85× |
+| DSpark | 4 | 2.36× |   1.58× |       0.84× |
+
+输入轨迹并非全部与普通 decode 相同，部分低匹配输入没有收益；这些数字仅代表对应单卡负载的实测耗时，不是通用加速比。完整五类输入、接受率、输出差异和原始日志索引见 [块草稿评估](docs/block_draft_implementation.md)。
 
 ## 安装与使用
 
@@ -75,26 +87,14 @@ finally:
 
 ## 实现文档
 
+- [文档总索引](docs/README.md)
 - [模型执行器与异步状态管理](docs/model_runner_v2.md)
 - [混合模型前缀缓存](docs/prefix_caching.md)
 - [CUDA Graph 与缓冲区管理](docs/cuda_graph_optimization.md)
 - [GDN 内核与共享预填充实现](docs/gdn_kernel_optimization.md)
 - [投机解码实施计划](docs/speculative_decoding_plan.md)
 - [投机解码实现进度与验收边界](docs/speculative_decoding_progress.md)
-- [vLLM 参考与模型草稿适配契约](docs/vllm_speculative_alignment.md)
-- [模型数值验收记录](docs/qwen35_acceptance.md)
-
-## 投机解码进度与后续计划
-
-已实现变长批量 target 验证、原 trial GDN 端点选择、GPU 接受/提交、共享随机拒绝
-采样和真实 Qwen3.5 MTP。验收关注数学语义、端点正确与数值/质量预算；跨浮点
-路径的 greedy token 相同率作为诊断。投机默认关闭，开启后默认 `packed_guarded`。
-显式 `packed` 用于多词元执行。MTP 当前要求 eager、关闭 prefix cache。
-
-下一阶段建议补齐 MTP K=1/2/4、B1/B4 性能扫描与分项测量，建立普通 decode graph
-对照，再优化批量 proposer、图执行与候选长度选择。当前性能入口仅支持 B1，
-B4 和图路径对照需扩展入口；质量与系统覆盖伴随推进。
-EAGLE-3/P-EAGLE、DFlash/DFlash2/DSpark 和 MoE 尚未实现。
-
-实现与限制见 [公共链路与 MTP](docs/speculative_mtp_implementation.md)，
-测量见 [MTP 评估](docs/mtp1_evaluation.md)，任务顺序见 [实施计划](docs/speculative_decoding_plan.md)。
+- [MTP 实现与评估](docs/speculative_mtp_implementation.md)
+- [EAGLE-3 适配](docs/eagle3_implementation.md)
+- [DFlash / DSpark 实现与实测](docs/block_draft_implementation.md)
+- [概率 MTP 实测](docs/mtp_random_evaluation.md)
