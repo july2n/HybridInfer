@@ -17,7 +17,7 @@ from hybridinfer.layers.attention import Attention, store_kvcache, flash_attn_wi
 from hybridinfer.layers.linear import LinearBase
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.spec_decode import SpeculativeConfig
-from hybridinfer.spec_decode.batch_execution import packed_batch_forward
+from hybridinfer.engine.spec_verification.batch_execution import packed_batch_forward
 from hybridinfer.spec_decode.metadata import VerificationBatch
 from hybridinfer.spec_decode.interfaces import VerificationPlan
 from hybridinfer.utils.context import BatchDescriptor, get_context, reset_context, set_context

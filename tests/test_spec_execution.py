@@ -1,10 +1,12 @@
 from types import SimpleNamespace
 import unittest
+from unittest.mock import Mock
 import torch
 from hybridinfer.engine.sequence import Sequence
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.spec_decode.config import SpeculativeConfig
 from hybridinfer.scheduler import Scheduler
+from hybridinfer.spec_decode.ngram import NgramProposer
 
 
 class IntegrationTests(unittest.TestCase):
@@ -41,7 +43,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(plan.candidates, (3, 4, 1, 2))
         self.assertIn(seq.seq_id, scheduler.in_flight)
         self.assertEqual(list(scheduler.running), [])
-        from hybridinfer.spec_decode.verifier import accept_greedy
+        from hybridinfer.sampling.greedy_reference import accept_greedy
         result = accept_greedy(plan, (3, 4, 99, 99, 99), remaining_output_tokens=10, max_model_len=24)
         scheduler.finish_speculative(seq, result)
         self.assertEqual(seq.num_cached_tokens, 8)
@@ -61,6 +63,28 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(len(scheduler.block_manager.free_block_ids), before)
         self.assertEqual(list(scheduler.running), [seq])
         self.assertFalse(scheduler.in_flight)
+
+    def test_next_round_draft_is_consumed_once_and_refreshed_after_rejection(self):
+        scheduler = self.scheduler()
+        seq = self.ready(scheduler)
+        scheduler.draft_proposer = Mock(wraps=NgramProposer(scheduler.speculative))
+        scheduler.prepare_next_draft(seq)
+        cached = seq.spec_token_ids
+        self.assertTrue(cached)
+        self.assertEqual(scheduler.draft_proposer.propose.call_count, 1)
+
+        selected, plans = scheduler.begin_speculative_batch()
+        self.assertEqual(selected, [seq])
+        self.assertEqual(plans[0].candidates, cached)
+        self.assertEqual(scheduler.draft_proposer.propose.call_count, 1)
+
+        from hybridinfer.sampling.greedy_reference import accept_greedy
+        result = accept_greedy(plans[0], (99,) * (len(cached) + 1),
+                               remaining_output_tokens=10, max_model_len=24)
+        scheduler.finish_speculative(seq, result)
+        self.assertEqual(seq.token_ids[-1], 99)
+        self.assertEqual(seq.spec_base_length, seq.num_cached_tokens)
+        self.assertEqual(scheduler.draft_proposer.propose.call_count, 2)
 
     def test_disabled_random_batch_and_resource_fallbacks(self):
         for kwargs, reason in (({'speculative': None}, None), ({'num_kvcache_blocks': 2}, 'kv_capacity_or_shared_tail')):

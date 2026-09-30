@@ -9,13 +9,13 @@ from hybridinfer.engine.request_state import InputBatch
 from hybridinfer.engine.sequence import Sequence
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.scheduler import Scheduler
-from hybridinfer.spec_decode.batch_execution import verify_speculative_batch
-from hybridinfer.spec_decode.batch_verifier import accept_greedy_batch, results_from_payload
-from hybridinfer.spec_decode.commit import commit_batch
+from hybridinfer.engine.spec_verification.batch_execution import verify_speculative_batch
+from hybridinfer.sampling.batch_verifier import accept_greedy_batch, results_from_payload
+from hybridinfer.engine.spec_verification.commit import commit_batch
 from hybridinfer.spec_decode.config import SpeculativeConfig
 from hybridinfer.spec_decode.interfaces import VerificationPlan
 from hybridinfer.spec_decode.metadata import VerificationBatch
-from hybridinfer.spec_decode.verifier import accept_greedy
+from hybridinfer.sampling.greedy_reference import accept_greedy
 from hybridinfer.utils.context import get_context
 
 
@@ -220,7 +220,7 @@ class BatchExecutionTests(unittest.TestCase):
         def fail(*args):
             runner.gdn_layers[0].recurrent_states[slots[0]].add_(99)
             raise RuntimeError('commit failed')
-        with patch('hybridinfer.spec_decode.batch_execution.select_endpoints', side_effect=fail):
+        with patch('hybridinfer.engine.spec_verification.batch_execution.select_endpoints', side_effect=fail):
             with self.assertRaisesRegex(RuntimeError, 'commit failed'):
                 verify_speculative_batch(runner, seqs, plans)
         self.assertTrue(torch.equal(runner.request_state.tokens.tensor, tokens))
@@ -241,7 +241,7 @@ class BatchExecutionTests(unittest.TestCase):
         def oom(*args, **kwargs):
             runner.gdn_layers[0].recurrent_states[4:].add_(1000)
             raise torch.cuda.OutOfMemoryError('test OOM')
-        with patch('hybridinfer.spec_decode.batch_execution.packed_batch_forward', side_effect=oom):
+        with patch('hybridinfer.engine.spec_verification.batch_execution.packed_batch_forward', side_effect=oom):
             results = verify_speculative_batch(runner, seqs, plans).get_output()
         self.assertEqual([r.token_ids for r in results], [(20,), (77,), (30,)])
         self.assertEqual(runner.spec_metrics['packed_resource_fallbacks'], 3)

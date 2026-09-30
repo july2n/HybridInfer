@@ -2,7 +2,7 @@ from types import SimpleNamespace
 import unittest
 import torch
 
-from hybridinfer.spec_decode.state import GDNTransaction
+from hybridinfer.engine.spec_verification.state import GDNTransaction
 from hybridinfer.engine.kv_cache_manager import BlockManager
 from hybridinfer.engine.sequence import Sequence
 

@@ -1,2 +1,2 @@
-"""Speculative decoding contracts and deterministic reference algorithms."""
+"""Speculative decoding configuration, proposer contracts and draft backends."""
 from .config import SpeculativeConfig

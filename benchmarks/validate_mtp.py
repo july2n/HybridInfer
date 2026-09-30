@@ -9,7 +9,7 @@ import torch
 from hybridinfer.engine.llm_engine import LLMEngine
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.spec_decode import SpeculativeConfig
-from hybridinfer.spec_decode import batch_execution
+from hybridinfer.engine.spec_verification import batch_execution
 from spec_validation import check_original_endpoints
 
 
@@ -68,16 +68,27 @@ def check_forward_contract(runner):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--model', default='models/Qwen3.5-0.8B')
+    parser.add_argument('--method', choices=['mtp', 'eagle3', 'dflash', 'dspark'], default='mtp')
+    parser.add_argument('--draft-model', help='Local trained draft checkpoint directory')
     parser.add_argument('--vllm-baseline', help='Optional completed full-engine reference JSON')
     parser.add_argument('--json-out', default='logs/validate/mtp_alignment_implementation.json')
     parser.add_argument('--output-tokens', type=int, default=128)
     parser.add_argument('--draft-tokens', type=int, default=1)
+    parser.add_argument('--draft-sampling', choices=['greedy', 'random'], default='greedy')
+    parser.add_argument('--temperature', type=float, default=0)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--prompt-tokens', type=int, default=509)
     parser.add_argument('--check-vllm-forward', action='store_true', help='Check pinned source operator-order contract')
     parser.add_argument('--batch-sizes', nargs='+', type=int, default=[1, 4])
     parser.add_argument('--modes', nargs='+', choices=['baseline', 'packed', 'packed_guarded'],
                         default=['baseline', 'packed', 'packed_guarded'])
+    parser.add_argument('--gpu-memory-utilization', type=float, default=.6)
+    parser.add_argument('--state-snapshot-budget-mb', type=int, default=256)
     args = parser.parse_args()
+    if args.method in ('eagle3', 'dflash', 'dspark') and (not args.draft_model or args.check_vllm_forward):
+        parser.error('This backend requires --draft-model; --check-vllm-forward is MTP-specific')
+    if args.draft_sampling == 'random' and any(m not in ('baseline', 'packed') for m in args.modes):
+        parser.error('random drafts require --modes baseline packed (or packed)')
     if min(args.output_tokens, args.prompt_tokens, args.draft_tokens, *args.batch_sizes) < 1:
         parser.error('lengths and batch sizes must be positive')
     if args.vllm_baseline:
@@ -99,7 +110,9 @@ def main():
         references = {}
     record = dict(acceptance_scope='execution_and_original_endpoint_selection',
                   completed=False, passed=False, cases=[], endpoint_checks=0, endpoint_failures=[],
-                  output_tokens=args.output_tokens, max_draft_tokens=args.draft_tokens, reference=args.vllm_baseline)
+                  output_tokens=args.output_tokens, max_draft_tokens=args.draft_tokens, reference=args.vllm_baseline,
+                  draft_sampling=args.draft_sampling, temperature=args.temperature, seed=args.seed,
+                  method=args.method, draft_model=args.draft_model)
     own_references = {}
     capture = {}
     original_forward = batch_execution.packed_batch_forward
@@ -112,10 +125,13 @@ def main():
     try:
         for mode in args.modes:
             spec = None if mode == 'baseline' else SpeculativeConfig(
-                enabled=True, method='mtp', max_draft_tokens=args.draft_tokens, verification_mode=mode)
+                enabled=True, method=args.method, draft_model=args.draft_model,
+                max_draft_tokens=args.draft_tokens, verification_mode=mode,
+                state_snapshot_budget_mb=args.state_snapshot_budget_mb,
+                mtp_draft_sampling=args.draft_sampling)
             engine = LLMEngine(args.model, max_num_seqs=max(args.batch_sizes),
                 max_model_len=max(map(len, fixtures.values()))+args.output_tokens+16,
-                max_num_batched_tokens=2048, gpu_memory_utilization=.6,
+                max_num_batched_tokens=2048, gpu_memory_utilization=args.gpu_memory_utilization,
                 enforce_eager=True, enable_prefix_cache=False, speculative=spec)
             runner = engine.model_runner
             if spec:
@@ -125,6 +141,19 @@ def main():
                 original_verify = runner.verify_speculative_batch
                 def verify(seqs, plans):
                     capture.clear()
+                    if args.draft_sampling == 'random':
+                        for plan in plans:
+                            q = plan.draft_probabilities
+                            if q is None or q.shape != (len(plan.candidates), runner.config.hf_config.vocab_size):
+                                raise AssertionError('Missing or misaligned realized MTP q')
+                            if not torch.isfinite(q).all() or (q < 0).any():
+                                raise AssertionError('Invalid MTP probability values')
+                            torch.testing.assert_close(q.sum(-1), torch.ones(q.shape[0], device=q.device))
+                            if plan.candidates:
+                                tokens = torch.tensor(plan.candidates, device=q.device)
+                                if not (q.gather(1, tokens[:, None]) > 0).all():
+                                    raise AssertionError('Sampled MTP candidate outside q support')
+                            record['draft_probability_checks'] = record.get('draft_probability_checks', 0)+1
                     handle = original_verify(seqs, plans)
                     results = handle.get_output()
                     if mode == 'packed' and capture.get('states'):
@@ -147,7 +176,8 @@ def main():
                 for batch_size in args.batch_sizes:
                     for name, prompt in fixtures.items():
                         output = engine.generate([prompt]*batch_size,
-                            SamplingParams(temperature=0, max_tokens=args.output_tokens, ignore_eos=True), use_tqdm=False)
+                            SamplingParams(temperature=args.temperature, seed=args.seed,
+                                           max_tokens=args.output_tokens, ignore_eos=True), use_tqdm=False)
                         tokens = [row['token_ids'] for row in output]
                         key = (name, batch_size)
                         if mode == 'baseline':
@@ -170,15 +200,32 @@ def main():
                             raise AssertionError('Finished request retained MTP cache ownership')
                 if spec:
                     record.setdefault('metrics', {})[mode] = dict(runner.spec_metrics)
-                    # Random mode exercises shared rejection and real greedy MTP q.
+                    # Exercise mixed greedy/random target requests through one batch.
                     if mode == 'packed':
                         sampled = engine.generate([next(iter(fixtures.values()))]*2,
-                            [SamplingParams(temperature=.8, seed=42+i, max_tokens=32, ignore_eos=True) for i in range(2)], use_tqdm=False)
+                            [SamplingParams(temperature=t, seed=args.seed+i, max_tokens=32, ignore_eos=True)
+                             for i, t in enumerate([0, .8])], use_tqdm=False)
                         record['random_lengths'] = [len(x['token_ids']) for x in sampled]
+                        if args.draft_sampling == 'random':
+                            repeated = engine.generate([next(iter(fixtures.values()))]*2,
+                                [SamplingParams(temperature=t, seed=args.seed+i, max_tokens=32, ignore_eos=True)
+                                 for i, t in enumerate([0, .8])], use_tqdm=False)
+                            record['seed_replay_match'] = all(a['token_ids'] == b['token_ids']
+                                for a, b in zip(sampled, repeated))
+                            if not record['seed_replay_match']:
+                                raise AssertionError('Explicit MTP seeds did not reproduce mixed generation')
             finally:
                 engine.exit()
         record['completed'] = True
-        record['execution_passed'] = (not record['endpoint_failures']
+        speculative_modes = [m for m in args.modes if m != 'baseline']
+        record['speculative_rounds_ok'] = all(
+            record.get('metrics', {}).get(m, {}).get('rounds', 0) > 0
+            and record['metrics'][m].get('draft_tokens', 0) > 0 for m in speculative_modes)
+        record['packed_endpoint_coverage_ok'] = ('packed' not in speculative_modes
+            or record['endpoint_checks'] > 0)
+        record['execution_passed'] = (record['speculative_rounds_ok']
+            and record['packed_endpoint_coverage_ok']
+            and not record['endpoint_failures']
             and all(x['lengths_ok'] for x in record['cases'])
             and record.get('random_lengths', [32, 32]) == [32, 32])
         record['hybrid_token_match'] = all(x['hybrid_first_mismatches'] is not None

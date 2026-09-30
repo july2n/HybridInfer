@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import torch
 from hybridinfer.layers.gated_delta_net import GatedDeltaNet, decode_gated_delta_rule
 from hybridinfer.layers.gdn_kernels import packed_causal_conv, indexed_gdn_decode
-from hybridinfer.spec_decode.endpoints import select_endpoints
+from hybridinfer.engine.spec_verification.endpoints import select_endpoints
 from hybridinfer.utils.context import set_context, get_context, reset_context, BatchDescriptor
 
 

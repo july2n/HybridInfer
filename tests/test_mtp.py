@@ -51,6 +51,48 @@ class MTPWeightTests(unittest.TestCase):
 
 
 class MTPPreparationTests(unittest.TestCase):
+    def test_probabilistic_drafts_realized_q_retry_and_request_reordering(self):
+        from types import SimpleNamespace
+        from hybridinfer.spec_decode.mtp import MTPProposer
+        from hybridinfer.spec_decode.interfaces import DraftContext
+        from hybridinfer.sampling.rejection_sampler import categorical, random_uniform
+        proposer = MTPProposer.__new__(MTPProposer)
+        logits = torch.tensor([[0., 1., 2.]])
+        proposer.runner = SimpleNamespace(
+            config=SimpleNamespace(speculative=SimpleNamespace(max_draft_tokens=3, mtp_draft_sampling='random')),
+            input_batch=SimpleNamespace(seq_id_to_slot={7: 0, 8: 1}),
+            request_state=SimpleNamespace(tokens=SimpleNamespace(tensor=torch.ones(2, 10, dtype=torch.int64))),
+            model=SimpleNamespace(lm_head=SimpleNamespace(weight=torch.ones(3, 1)), compute_logits=lambda h: logits))
+        proposer.features = torch.zeros(2, 10, 1)
+        proposer.validated, proposer.owners, proposer.last_hidden = [0, 0], [None, None], {}
+        proposer._forward = lambda slot, ids, features, *args: features+1
+        contexts = [DraftContext(7, (1, 1, 1, 1), 3, 8, 10, 4, .7, 42),
+                    DraftContext(8, (1, 1, 1), 2, 8, 10, 3, 0, 17)]
+        first = proposer.propose_device(contexts)
+        q = torch.softmax(logits.float()/.7, -1)
+        torch.testing.assert_close(first.probabilities[:3], q.expand(3, -1))
+        torch.testing.assert_close(first.probabilities[3:], torch.tensor([[0., 0., 1.], [0., 0., 1.]]))
+        expected = [int(categorical(q[0], random_uniform(42, 4+i, 'draft', 'cpu'))) for i in range(3)]
+        self.assertEqual(first.to_host().tokens_for(0), tuple(expected))
+        second = proposer.propose_device(contexts)
+        self.assertTrue(torch.equal(first.token_ids, second.token_ids))
+        self.assertTrue(torch.equal(first.probabilities, second.probabilities))
+        reordered = proposer.propose_device(contexts[::-1])
+        self.assertEqual(reordered.to_host().tokens_for(1), first.to_host().tokens_for(0))
+        torch.testing.assert_close(reordered.probabilities[2:], first.probabilities[:3])
+        empty = proposer.propose_device([])
+        self.assertEqual(empty.probabilities.shape, (0, 3))
+        zero = proposer.propose_device([DraftContext(7, (1, 1, 1, 1), 3, 1, 10, 4, 1, 42)])
+        self.assertEqual(zero.probabilities.shape, (0, 3))
+
+    def test_random_draft_config_requires_native_mtp(self):
+        from hybridinfer.spec_decode import SpeculativeConfig
+        for kwargs in [dict(method='ngram', verification_mode='packed', mtp_draft_sampling='random'),
+                       dict(method='mtp', mtp_draft_sampling='random'), dict(mtp_draft_sampling='unknown')]:
+            with self.assertRaises(ValueError):
+                SpeculativeConfig(**kwargs)
+        SpeculativeConfig(method='mtp', verification_mode='packed', mtp_draft_sampling='random')
+
     def test_shifted_ids_keep_target_positions_and_refresh_confirmed_features(self):
         from types import SimpleNamespace
         from hybridinfer.spec_decode.mtp import MTPProposer

@@ -12,7 +12,7 @@ import torch
 from hybridinfer.engine.llm_engine import LLMEngine
 from hybridinfer.sampling_params import SamplingParams
 from hybridinfer.spec_decode import SpeculativeConfig
-from hybridinfer.spec_decode import batch_execution
+from hybridinfer.engine.spec_verification import batch_execution
 from spec_workloads import natural_cases
 from spec_validation import snapshot, equal_state, check_original_endpoints
 

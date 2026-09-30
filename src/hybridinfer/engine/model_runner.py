@@ -11,9 +11,11 @@ from hybridinfer.config import Config
 from hybridinfer.engine.sequence import Sequence
 from hybridinfer.engine.cuda_graph import CudaGraphManager
 from hybridinfer.layers.sampler import Sampler
+from hybridinfer.sampling.rejection_sampler import RejectionSampler
 from hybridinfer.utils.context import set_context, get_context, reset_context, BatchDescriptor
 from hybridinfer.utils.loader import load_model
 from hybridinfer.utils.trace import trace_event
+from hybridinfer.engine.spec_verification.target_features import forward_with_draft, forward_verification_target
 
 from .kv_cache_manager import KVCacheStorage
 from .async_output import AsyncModelOutput
@@ -72,6 +74,7 @@ class ModelRunner:
             if isinstance(module, GatedDeltaNet)
         ]
         self.sampler = Sampler()
+        self.rejection_sampler = RejectionSampler()
         self.output_copy_stream = torch.cuda.Stream()
         # Benchmark can disable the copy stream to provide a synchronous D2H
         # baseline. Keep async output as the production default.
@@ -92,14 +95,10 @@ class ModelRunner:
         # Only the execute/sample entrypoints are paired; completed GPU
         # submissions may remain in flight independently in the engine queue.
         self._pending: tuple | None = None
-        self.spec_metrics = dict(rounds=0, draft_tokens=0, accepted_tokens=0,
-                                 output_tokens=0, trial_tokens=0, replay_tokens=0,
-                                 copy_seconds=0., verify_seconds=0.,
-                                 restore_seconds=0., commit_seconds=0.)
-        self.draft_proposer = None
-        if config.speculative and config.speculative.enabled and config.speculative.method == "mtp":
-            from hybridinfer.spec_decode.mtp import MTPProposer
-            self.draft_proposer = MTPProposer(self)
+        from hybridinfer.spec_decode.factory import create_draft_proposer
+        from hybridinfer.spec_decode.metrics import new_spec_metrics
+        self.spec_metrics = new_spec_metrics()
+        self.draft_proposer = create_draft_proposer(self)
         self.kv_cache_manager = KVCacheStorage(config, self.model, self.gdn_layers)
         self.kv_cache_manager.allocate_gdn_state_pool()
         self.kv_cache_manager.allocate_prefix_snapshots()
@@ -277,18 +276,15 @@ class ModelRunner:
             mode = "prefill" if is_prefill else "decode"
 
         if mode == "spec_decode":
-            return self.model.compute_logits(self.model(input_ids, positions))
+            return forward_verification_target(self, input_ids, positions)
 
         if getattr(self, 'draft_proposer', None) is not None:
-            hidden = self.model(input_ids, positions)
-            self.draft_proposer.record(self.batch_slots_gpu[:context.batch_descriptor.num_reqs],
-                                      positions, hidden, context.prefill_slices if is_prefill else None)
-            return self.compute_logits(hidden, is_prefill)
+            return forward_with_draft(self, input_ids, positions, is_prefill)
 
         return self.cuda_graphs.run(input_ids, positions, is_prefill)
 
     def verify_speculative_batch(self, seqs, plans):
-        from hybridinfer.spec_decode.batch_execution import verify_speculative_batch
+        from hybridinfer.engine.spec_verification.batch_execution import verify_speculative_batch
         return verify_speculative_batch(self, seqs, plans)
 
     def execute_model(self, seqs: list[Sequence], is_prefill: bool) -> None:

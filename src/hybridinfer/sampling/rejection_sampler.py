@@ -7,7 +7,7 @@ import hashlib
 import torch
 import triton
 import triton.language as tl
-from .batch_verifier import finish_batch
+from .batch_verifier import accept_greedy_batch, finish_batch
 
 
 def stream_seed(seed, position, domain):
@@ -100,3 +100,13 @@ def accept_random_batch(batch, metadata, logits, *, temperatures, seeds,
         sample_start += k+1
         draft_start += k
     return finish_batch(batch, output, torch.stack(prefixes), **limits)
+
+
+class RejectionSampler:
+    """GPU target acceptance for greedy and probabilistic draft proposals."""
+
+    def sample_greedy(self, batch, metadata, predictions, **limits):
+        return accept_greedy_batch(batch, metadata, predictions, **limits)
+
+    def sample_random(self, batch, metadata, logits, **options):
+        return accept_random_batch(batch, metadata, logits, **options)

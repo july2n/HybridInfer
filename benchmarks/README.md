@@ -93,3 +93,55 @@ PYTHONPATH=src python benchmarks/validate_nested_graphs.py --compile-segments --
 
 该脚本在同一输入及 KV/GDN 初态下比较原始 eager 和选定图路径的 logits、
 概率与状态，并沿 eager 历史推进；仅作局部数值诊断。
+### Nested CUDA Graph 性能对比
+
+分别在独立进程中运行，保持编译关闭、prefix cache 关闭和默认异步调度一致：
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n vllm_env python benchmarks/bench_nested_graphs.py --mode NONE --json-out logs/bench/nested_none.json
+PYTHONPATH=src conda run --no-capture-output -n vllm_env python benchmarks/bench_nested_graphs.py --mode FULL_AND_PIECEWISE --json-out logs/bench/nested_full_piecewise.json
+```
+
+2026-09-29，Qwen3.5-0.8B，RTX 3060 Ti，TP=1；每请求输入 64 tokens、64 步 decode，
+每个 batch 预热 2 轮、测量 5 轮。以下为引擎 wall time 中位数，包含调度与采样，排除初始化和预热。
+
+| Batch | Prefill NONE / Graph (ms) | Decode 每步 NONE / Graph (ms) | Decode 加速 | 端到端加速 |
+|---|---|---|---|---|
+| 1 | 24.79 / 19.34 | 14.55 / 5.95 | 2.44x | 2.39x |
+| 4 | 39.75 / 27.70 | 15.66 / 8.53 | 1.84x | 1.82x |
+| 16 | 124.65 / 84.83 | 17.98 / 10.61 | 1.69x | 1.67x |
+| 32 | 231.46 / 136.98 | 23.72 / 12.91 | 1.84x | 1.81x |
+
+所有开启图的测量批次均记录到 1 次 PIECEWISE prefill 和 64 次 FULL decode；NONE 均为 65 次 NONE。
+输入为固定长度随机 token，生成长度固定；这是单卡合成负载结果，未覆盖 mixed、长上下文或编译开启场景。
+
+## 概率 MTP 草稿验证
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n vllm_env python benchmarks/validate_mtp.py \
+  --draft-sampling random --temperature 0.8 --modes packed --draft-tokens 2 \
+  --prompt-tokens 64 --output-tokens 32 --batch-sizes 1 4 \
+  --json-out logs/validate/mtp_probabilistic_k2.json
+```
+
+该入口检查真实草稿 q 的布局、归一化与候选支持，原 trial 接受端点、提交历史和资源生命周期，并追加 greedy/random 混合请求验证。采样配置见 [MTP 实现](../docs/speculative_mtp_implementation.md)。
+
+概率草稿与 greedy 草稿的配对性能对照：
+
+```bash
+PYTHONPATH=src conda run --no-capture-output -n vllm_env python benchmarks/bench_spec_decode.py \
+  --method mtp --enforce-eager --suite natural --draft-sweep 1 2 4 \
+  --modes baseline packed packed_random --temperature 0.8 --seed 42 \
+  --prompt-tokens 128 --output-tokens 64 --warmups 1 --repeats 5 \
+  --json-out logs/bench/mtp_random_fair.json
+```
+
+`packed` 为 greedy MTP 草稿，`packed_random` 为按请求温度采样的概率 MTP 草稿；两者都使用 native packed 验证。每轮三种模式共享 seed，轮间改变 seed 并轮换执行顺序。结果报告实际 decode 耗时比、接受率与输出差异；随机域不同，不要求同 seed 下逐 token 相同。
+
+## EAGLE-3
+
+`validate_mtp.py` 和 `bench_spec_decode.py` 现支持 `--method eagle3 --draft-model /本地配套草稿路径`。初始范围与权重格式见 [EAGLE-3 说明](../docs/eagle3_implementation.md)。未训练夹具仅用于协议测试，不应用于加速/质量报告。
+
+## DFlash / DSpark
+
+Qwen3.5-2B 公开草稿权重的下载、运行范围、验证命令见 [块草稿适配](../docs/block_draft_implementation.md)。

@@ -3,6 +3,8 @@ from collections import deque
 from hybridinfer.config import Config
 from hybridinfer.engine.sequence import Sequence, SequenceStatus
 from hybridinfer.engine.kv_cache_manager import KVCacheManager
+from hybridinfer.spec_decode.interfaces import DraftContext, VerificationPlan
+from hybridinfer.spec_decode.ngram import NgramProposer
 
 
 class Scheduler:
@@ -12,10 +14,10 @@ class Scheduler:
         self.draft_proposer = None
         self.spec_fallbacks = {}
         self._spec_trial_block_counts = {}
+        self.max_speculative_tokens = config.max_num_batched_tokens
         self.max_num_seqs = config.max_num_seqs
         self.max_model_len = config.max_model_len
         self.max_num_batched_tokens = config.max_num_batched_tokens
-        self.max_speculative_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.enable_prefix_cache = config.enable_prefix_cache
@@ -38,6 +40,46 @@ class Scheduler:
             raise ValueError("prompt must fit within max_model_len and contain tokens")
         self.waiting.append(seq)
 
+    def configure_draft(self, runner):
+        self.draft_proposer = runner.draft_proposer
+        config = self.speculative
+        if not config or not config.enabled:
+            return
+        per_token = sum(
+            layer.conv_states[0].numel()*layer.conv_states.element_size()
+            + layer.recurrent_states[0].numel()*layer.recurrent_states.element_size()
+            for layer in runner.gdn_layers)
+        if per_token:
+            self.max_speculative_tokens = min(self.max_num_batched_tokens,
+                config.state_snapshot_budget_mb*1024**2//per_token)
+
+    def prepare_next_draft(self, seq):
+        """CPU/bookkeeping-stage proposer for the following decode round."""
+        seq.spec_token_ids = ()
+        seq.spec_draft_probabilities = None
+        seq.spec_base_length = -1
+        config = self.speculative
+        if (not config or not config.enabled or seq.is_finished
+                or seq.num_tokens != seq.num_cached_tokens+1
+                or self.max_speculative_tokens <= 1):
+            return
+        budget = min(self.max_speculative_tokens, config.max_draft_tokens+1)
+        context = DraftContext(seq.seq_id, tuple(seq.token_ids), seq.num_cached_tokens,
+                               seq.max_tokens-seq.num_completion_tokens,
+                               self.max_model_len, budget, seq.temperature, seq.seed)
+        proposal = (self.draft_proposer or NgramProposer(config)).propose([context])
+        seq.spec_token_ids = proposal.tokens_for(0)
+        seq.spec_draft_probabilities = proposal.probabilities
+        seq.spec_base_length = seq.num_cached_tokens
+
+    def _draft_for_schedule(self, seq, budget):
+        if seq.spec_base_length != seq.num_cached_tokens:
+            # Bootstrap manually admitted requests and recover an invalidated cache.
+            self.prepare_next_draft(seq)
+        count = max(0, min(len(seq.spec_token_ids), budget-1))
+        q = seq.spec_draft_probabilities
+        return seq.spec_token_ids[:count], q[:count] if q is not None else None
+
     def begin_speculative_batch(self):
         """Reserve ready decode requests, including B=1 and zero-draft rows."""
         config = self.speculative
@@ -48,24 +90,17 @@ class Scheduler:
             return None
         if self.waiting or self.in_flight or not self.running:
             return fallback("batch_or_prefill")
-        from hybridinfer.spec_decode.interfaces import DraftContext, VerificationPlan
-        from hybridinfer.spec_decode.ngram import NgramProposer
         seqs = list(self.running)[:min(self.max_num_seqs, self.max_num_batched_tokens, self.max_speculative_tokens)]
         if any(seq.temperature != 0 for seq in seqs) and config.verification_mode != "packed":
             return fallback("temperature")
         remaining = self.max_speculative_tokens
         plans = []
-        proposer = self.draft_proposer or NgramProposer(config)
         for row, seq in enumerate(seqs):
             # Reserve at least one anchor row for each later request.
             budget = remaining-(len(seqs)-row-1)
-            context = DraftContext(seq.seq_id, tuple(seq.token_ids), seq.num_cached_tokens,
-                                   seq.max_tokens-seq.num_completion_tokens,
-                                   self.max_model_len, budget)
-            proposal = proposer.propose([context])
-            candidates = proposal.tokens_for(0)
+            candidates, probabilities = self._draft_for_schedule(seq, budget)
             plan = VerificationPlan(seq.seq_id, seq.num_cached_tokens, seq.last_token, candidates,
-                                    proposal.probabilities)
+                                    probabilities)
             plans.append(plan)
             remaining -= len(plan.input_tokens)
         if not any(p.candidates for p in plans):
@@ -107,6 +142,7 @@ class Scheduler:
         else:
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
+            self.prepare_next_draft(seq)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         scheduled_seqs = []
@@ -211,6 +247,9 @@ class Scheduler:
         self.resident.discard(seq.seq_id)
         self.preempted.append(seq.seq_id)
         self.kv_cache_manager.free(seq)
+        seq.spec_token_ids = ()
+        seq.spec_draft_probabilities = None
+        seq.spec_base_length = -1
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
@@ -232,6 +271,7 @@ class Scheduler:
             else:
                 seq.status = SequenceStatus.RUNNING
                 self.running.append(seq)  # back to schedulable
+                self.prepare_next_draft(seq)
 
     @property
     def block_manager(self):

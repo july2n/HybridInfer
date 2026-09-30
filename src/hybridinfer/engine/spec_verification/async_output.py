@@ -1,7 +1,7 @@
 """Independent variable-length output storage and completion ownership."""
 import torch
 
-from .batch_verifier import results_from_payload
+from hybridinfer.sampling.batch_verifier import results_from_payload
 
 
 class AsyncVerificationOutput:

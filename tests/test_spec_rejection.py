@@ -2,8 +2,8 @@ import unittest
 import torch
 from hybridinfer.spec_decode.interfaces import VerificationPlan
 from hybridinfer.spec_decode.metadata import VerificationBatch
-from hybridinfer.spec_decode.batch_verifier import accept_greedy_batch
-from hybridinfer.spec_decode.rejection import accept_random_batch, residual_distribution, stream_seed
+from hybridinfer.sampling.batch_verifier import accept_greedy_batch
+from hybridinfer.sampling.rejection_sampler import accept_random_batch, residual_distribution, stream_seed
 
 
 class RejectionTests(unittest.TestCase):
@@ -51,7 +51,7 @@ class RejectionTests(unittest.TestCase):
         self.assertEqual(len(seeds), 400)
 
     def test_actual_sampler_marginal_for_point_mass_and_probabilistic_drafts(self):
-        from hybridinfer.spec_decode.rejection import categorical, random_uniform, rejection_decisions
+        from hybridinfer.sampling.rejection_sampler import categorical, random_uniform, rejection_decisions
         p = torch.tensor([.2, .5, .3])
         for q in [torch.tensor([.7, .2, .1]), torch.tensor([0., 1., 0.])]:
             candidate = categorical(q, random_uniform(42, 10, 'draft', 'cpu', (20000,)))

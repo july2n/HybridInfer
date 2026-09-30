@@ -11,11 +11,10 @@ import torch
 
 from hybridinfer.utils.context import BatchDescriptor, set_context, reset_context
 from .async_output import AsyncVerificationOutput
-from .batch_verifier import accept_greedy_batch
-from .rejection import accept_random_batch
+from hybridinfer.sampling.rejection_sampler import RejectionSampler
 from .commit import commit_batch
-from .interfaces import VerificationPlan
-from .metadata import VerificationBatch
+from hybridinfer.spec_decode.interfaces import VerificationPlan
+from hybridinfer.spec_decode.metadata import VerificationBatch
 from .state import GDNTransaction
 from .endpoints import begin_endpoints, select_endpoints
 
@@ -49,7 +48,9 @@ def packed_batch_forward(runner, seqs, batch, state_slots, *, project=True):
                                                  counts[0] if len(set(counts)) == 1 else None,
                                                  max(counts)))
     endpoints = begin_endpoints(runner, len(inputs), len(seqs))
-    hidden = runner.model(make(inputs), make(positions))
+    proposer = getattr(runner, 'draft_proposer', None)
+    forward = proposer.forward_target if proposer is not None else runner.model
+    hidden = forward(make(inputs), make(positions))
     runner._trial_endpoints = endpoints
     proposer = getattr(runner, 'draft_proposer', None)
     if proposer is not None:
@@ -72,7 +73,9 @@ def _decode_batch_anchors(runner, seqs, plans, state_slots):
                 block_tables=runner.request_state.block_tables.tensor.index_select(0, make(slots)),
                 state_indices=make(state_slots),
                 batch_descriptor=BatchDescriptor('spec_decode', len(seqs), len(seqs), 1, 1))
-    hidden = runner.model(make([p.anchor for p in plans]), make([p.computed_length for p in plans]))
+    proposer = getattr(runner, 'draft_proposer', None)
+    forward = proposer.forward_target if proposer is not None else runner.model
+    hidden = forward(make([p.anchor for p in plans]), make([p.computed_length for p in plans]))
     proposer = getattr(runner, 'draft_proposer', None)
     if proposer is not None:
         proposer.record(make(slots), make([p.computed_length for p in plans]), hidden)
@@ -125,6 +128,7 @@ def verify_speculative_batch(runner, seqs, plans):
                     for slot, p in zip(slots, plans)]
     saved_last = runner.sampled_token_ids_gpu.index_select(0, slots_t).clone()
     mode = runner.config.speculative.verification_mode
+    rejection_sampler = getattr(runner, 'rejection_sampler', None) or RejectionSampler()
     guarded, used_packed = mode == 'packed_guarded', mode == 'packed'
     stats = runner.spec_metrics
     extra = dict(batch_rounds=1, batch_requests=len(seqs),
@@ -221,7 +225,7 @@ def verify_speculative_batch(runner, seqs, plans):
                                 q.scatter_(1, torch.tensor(p.candidates, device=device)[:, None], 1.)
                         probs.append(q)
                     draft_probs = torch.cat(probs)
-                acceptance = accept_random_batch(batch, batch.tensors(device), native_logits,
+                acceptance = rejection_sampler.sample_random(batch, batch.tensors(device), native_logits,
                     draft_probs=draft_probs,
                     temperatures=[s.temperature for s in seqs],
                     seeds=[s.seed if s.seed is not None else torch.initial_seed()+s.seq_id for s in seqs],
@@ -234,12 +238,12 @@ def verify_speculative_batch(runner, seqs, plans):
                 sampled = runner.sampler.sample(hidden_logits, slots_t,
                     state.temperatures.tensor, state.seeds.tensor,
                     state.computed.tensor+1)
-                acceptance = accept_greedy_batch(acceptance_batch, acceptance_batch.tensors(device), sampled,
+                acceptance = rejection_sampler.sample_greedy(acceptance_batch, acceptance_batch.tensors(device), sampled,
                     remaining_output_tokens=[s.max_tokens-s.num_completion_tokens for s in seqs],
                     max_model_len=runner.config.max_model_len, eos=runner.config.eos,
                     ignore_eos=[s.ignore_eos for s in seqs])
             else:
-                acceptance = accept_greedy_batch(
+                acceptance = rejection_sampler.sample_greedy(
                     acceptance_batch, acceptance_batch.tensors(device), predictions,
                     remaining_output_tokens=[s.max_tokens-s.num_completion_tokens for s in seqs],
                     max_model_len=runner.config.max_model_len, eos=runner.config.eos,

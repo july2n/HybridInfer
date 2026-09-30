@@ -54,14 +54,22 @@ def main():
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--warmups', type=int, default=1)
     parser.add_argument('--draft-tokens', type=int, default=4)
-    parser.add_argument('--method', choices=('ngram', 'mtp'), default='ngram')
+    parser.add_argument('--method', choices=('ngram', 'mtp', 'eagle3', 'dflash', 'dspark'), default='ngram')
+    parser.add_argument('--draft-model', help='Local trained draft checkpoint directory')
+    parser.add_argument('--temperature', type=float, default=0)
+    parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--enforce-eager', action='store_true')
     parser.add_argument('--suite', choices=('synthetic', 'natural'), default='synthetic')
     parser.add_argument('--cases', nargs='+', help='Subset of named cases from the selected suite')
     parser.add_argument('--draft-sweep', type=int, nargs='+', help='Candidate limits, e.g. 1 2 4 8')
-    parser.add_argument('--modes', nargs='+', choices=('baseline', 'sequential', 'packed', 'packed_guarded'),
+    parser.add_argument('--modes', nargs='+', choices=('baseline', 'sequential', 'packed', 'packed_guarded', 'packed_random'),
                         default=['baseline', 'packed'])
+    parser.add_argument('--gpu-memory-utilization', type=float, default=.6)
+    parser.add_argument('--state-snapshot-budget-mb', type=int, default=256)
     args = parser.parse_args()
+    if 'packed_random' in args.modes and args.method != 'mtp':
+        parser.error('packed_random requires --method mtp')
+    SamplingParams(temperature=args.temperature, seed=args.seed)
     if min(args.output_tokens, args.prompt_tokens, args.repeats, args.warmups, args.draft_tokens) < 1:
         parser.error('lengths, repeats and warmups must be positive')
     draft_limits = args.draft_sweep or [args.draft_tokens]
@@ -78,14 +86,19 @@ def main():
                        max_model_len=args.prompt_tokens+args.output_tokens+8,
                        max_num_batched_tokens=max(512, args.prompt_tokens),
                        enforce_eager=args.enforce_eager, use_prefill_cudagraph=False,
-                       gpu_memory_utilization=0.6, enable_prefix_cache=False,
-                       speculative=SpeculativeConfig(enabled=True, method=args.method))
+                       gpu_memory_utilization=args.gpu_memory_utilization, enable_prefix_cache=False,
+                       speculative=SpeculativeConfig(enabled=True, method=args.method, draft_model=args.draft_model,
+                                                     state_snapshot_budget_mb=args.state_snapshot_budget_mb))
     records = []
-    def measure(prompt, mode, draft_limit):
-        config = SpeculativeConfig(enabled=True, verification_mode=mode,
-                                   method=args.method, max_draft_tokens=draft_limit) if mode != 'baseline' else None
+    def measure(prompt, mode, draft_limit, seed):
+        config = SpeculativeConfig(enabled=True, verification_mode='packed' if mode == 'packed_random' else mode,
+                                   mtp_draft_sampling='random' if mode == 'packed_random' else 'greedy',
+                                   method=args.method, draft_model=args.draft_model,
+                                   max_draft_tokens=draft_limit,
+                                   state_snapshot_budget_mb=args.state_snapshot_budget_mb) if mode != 'baseline' else None
         engine.config.speculative = engine.scheduler.speculative = config
-        engine.add_request(prompt, SamplingParams(temperature=0, max_tokens=args.output_tokens, ignore_eos=True))
+        engine.add_request(prompt, SamplingParams(temperature=args.temperature, seed=seed,
+                           max_tokens=args.output_tokens, ignore_eos=True))
         seq = engine.scheduler.waiting[-1]
         before = dict(engine.model_runner.spec_metrics)
         fallback_before = dict(engine.scheduler.spec_fallbacks)
@@ -110,14 +123,14 @@ def main():
                     scheduler_fallbacks=fallbacks,
                     peak_allocated_bytes=torch.cuda.max_memory_allocated(), tokens=seq.completion_token_ids)
 
-    def run(prompt, mode, draft_limit):
+    def run(prompt, mode, draft_limit, seed):
         # Share allocations, but exclude MTP feature recording from baseline.
         # Restore ownership even if measurement fails.
         proposer = engine.model_runner.draft_proposer
         try:
             if mode == 'baseline':
                 engine.model_runner.draft_proposer = None
-            return measure(prompt, mode, draft_limit)
+            return measure(prompt, mode, draft_limit, seed)
         finally:
             engine.model_runner.draft_proposer = proposer
 
@@ -127,9 +140,9 @@ def main():
             prompt = prepare_prompt(engine.tokenizer, text, args.prompt_tokens, normalization)
             for draft_limit in draft_limits:
                 modes = args.modes
-                for _ in range(args.warmups):
+                for warmup in range(args.warmups):
                     for mode in modes:
-                        run(prompt, mode, draft_limit)
+                        run(prompt, mode, draft_limit, args.seed+warmup)
                 samples_by_mode = {mode: [] for mode in modes}
                 orders = []
                 # Rotate the first mode so clock/thermal drift does not always
@@ -138,7 +151,7 @@ def main():
                     shift = repeat % len(modes)
                     order = modes[shift:] + modes[:shift]
                     orders.append(order)
-                    paired = {mode: run(prompt, mode, draft_limit) for mode in order}
+                    paired = {mode: run(prompt, mode, draft_limit, args.seed+args.warmups+repeat) for mode in order}
                     for mode in modes:
                         samples_by_mode[mode].append(paired[mode])
                 baseline = samples_by_mode['baseline']
@@ -156,7 +169,7 @@ def main():
     finally:
         metadata = dict(model=str(Path(args.model).resolve()), torch=torch.__version__, cuda=torch.version.cuda,
                         gpu=torch.cuda.get_device_name(), precision=str(engine.config.hf_config.dtype),
-                        batch_size=1, prefix_cache=False, temperature=0, ignore_eos=True,
+                        batch_size=1, prefix_cache=False, temperature=args.temperature, seed=args.seed, ignore_eos=True,
                         decode_graphs=not args.enforce_eager, native_verification='eager',
                         warmups_per_case_mode=args.warmups, repeats=args.repeats,
                         prompt_tokens=args.prompt_tokens, output_tokens=args.output_tokens,
@@ -166,6 +179,7 @@ def main():
                         enabled_default_verification=SpeculativeConfig().verification_mode,
                         max_draft_tokens=draft_limits,
                         draft_method=args.method,
+                        draft_model=args.draft_model,
                         baseline_target_feature_tracking=False,
                         scope='offline decode and whole generation')
         engine.exit()

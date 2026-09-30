@@ -1,5 +1,5 @@
 """CPU reference for greedy prediction-row alignment and endpoint selection."""
-from .interfaces import VerificationResult
+from hybridinfer.spec_decode.interfaces import VerificationResult
 
 
 def accept_greedy(plan, predictions, *, remaining_output_tokens,

@@ -17,6 +17,8 @@ class DraftContext:
     remaining_output_tokens: int
     max_model_len: int
     verification_budget: int
+    temperature: float = 0.0
+    seed: int | None = None
 
     def __post_init__(self):
         if len(self.token_ids) != self.computed_length + 1:
@@ -24,6 +26,10 @@ class DraftContext:
         if min(self.computed_length, self.remaining_output_tokens,
                self.max_model_len, self.verification_budget) < 0:
             raise ValueError("lengths and budgets must be nonnegative")
+        if not 0 <= self.temperature < float("inf"):
+            raise ValueError("draft temperature must be finite and nonnegative")
+        if self.seed is not None and not 0 <= self.seed < 2**63:
+            raise ValueError("draft seed must be in [0, 2**63)")
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,7 +86,7 @@ class VerificationResult:
 class DeviceDraftProposal:
     """Packed CUDA candidates; q=None explicitly means point-mass drafts.
 
-    Future probabilistic backends supply the probabilities actually used to
+    Probabilistic backends supply the probabilities actually used to
     sample the candidates. Offsets include a leading zero (B+1 coordinates).
     """
     request_ids: tuple[int, ...]

@@ -20,7 +20,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
-from hybridinfer.spec_decode.batch_verifier import accept_greedy_batch
+from hybridinfer.sampling.batch_verifier import accept_greedy_batch
 from hybridinfer.spec_decode.interfaces import VerificationPlan
 from hybridinfer.spec_decode.metadata import VerificationBatch
 

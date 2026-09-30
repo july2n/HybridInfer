@@ -14,9 +14,9 @@
 `packed_guarded`；显式 `packed` 执行多词元接受与原 trial 端点提交。
 
 MTP 当前要求 eager、关闭 prefix cache，使用单个预测层、共享 embedding/head、
-独立 draft KV 和 target feature 历史。草稿为 greedy 点质量，可服务随机 target。
+独立 draft KV 和 target feature 历史。MTP 支持 greedy 点质量与可选概率草稿，可服务随机 target。
 当前不混合 prefill 与投机验证。树候选需独立 mask、位置和 GDN 分支状态。
-最终草稿范围为 MTP、EAGLE-3、P-EAGLE、DFlash、DFlash2、DSpark；后五种尚未实现。
+最终草稿范围为 MTP、EAGLE-3、P-EAGLE、DFlash、DFlash2、DSpark；EAGLE-3 初始线性架构已接入，尚缺配套训练权重验收；后四种尚未实现。
 
 ## 2. 公共架构
 
@@ -28,7 +28,7 @@ MTP 当前要求 eager、关闭 prefix cache，使用单个预测层、共享 em
 | `batch_verifier.py`、`rejection.py` | GPU 接受、补偿/bonus 与停止条件 |
 | `state.py`、`endpoints.py` | 状态事务、共享 conv 历史与 recurrent 端点 |
 | `commit.py`、`async_output.py` | 有效历史/长度提交、输出缓冲区及完成事件 |
-| `mtp.py`、`models/qwen3_5_mtp.py` | 特征历史、draft KV、真实模型与权重 |
+| `spec_decode/mtp.py`、`models/qwen3_5_mtp.py` | 特征历史、draft KV、真实模型与权重 |
 | `ngram.py`、`verifier.py` | 历史匹配草稿和 CPU 接受参考 |
 
 设备候选在调度适配边界仍转为 CPU tuple，当前不是全设备调度。
@@ -74,7 +74,7 @@ MTP 当前要求 eager、关闭 prefix cache，使用单个预测层、共享 em
 
 例如候选 `[A,B,C]`，三行 target argmax 为 `[A,X,C]`，实际输出只能是 `[A,X]`。第三行即使匹配也依赖已拒绝的 B，不可采用；已有 bonus 分布同样失效，不能在 correction 后继续输出 bonus。全接受时输出 `[A,B,C,bonus]`。bonus 在 vLLM 中可以预先采样，但仅全接受时提交。
 
-随机模式不能使用 argmax 相等判定。对候选 d_i 使用 `min(1,p_i(d_i)/q_i(d_i))` 接受概率，首个拒绝位置从归一化的 `max(p_i-q_i,0)` 取 correction；全接受从 p_(K+1) 取 bonus。n-gram 的 `draft_probs=None` 在 vLLM 中对应确定候选的点质量 q，候选处 q(d_i)=1，不代表跳过概率校正。目标 logits 的处理和采样约束必须符合实际配置，后续位置的处理应使用对应假设历史；共享随机拒绝采样已实现；当前 MTP 使用 greedy 点质量草稿。
+随机模式不能使用 argmax 相等判定。对候选 d_i 使用 `min(1,p_i(d_i)/q_i(d_i))` 接受概率，首个拒绝位置从归一化的 `max(p_i-q_i,0)` 取 correction；全接受从 p_(K+1) 取 bonus。n-gram 的 `draft_probs=None` 在 vLLM 中对应确定候选的点质量 q，候选处 q(d_i)=1，不代表跳过概率校正。目标 logits 的处理和采样约束必须符合实际配置，后续位置的处理应使用对应假设历史；共享随机拒绝采样已实现；当前 MTP 默认使用 greedy 点质量草稿，也可通过 `mtp_draft_sampling="random"` 返回实际概率 q。
 
 vLLM 输出缓冲区为 `[B,max(K_i)+1]`，未输出部分填占位 token。本项目可使用等价布局，但必须返回每请求有效长度，不能把占位值、拒绝尾部或未采用的 bonus 当作正式输出。
 

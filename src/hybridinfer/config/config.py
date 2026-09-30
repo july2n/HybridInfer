@@ -34,9 +34,9 @@ class Config:
             raise TypeError("speculative must be a SpeculativeConfig")
         if self.speculative and self.speculative.enabled and self.tensor_parallel_size != 1:
             raise ValueError("Speculative decoding currently requires a single GPU")
-        if self.speculative and self.speculative.enabled and self.speculative.method == "mtp":
+        if self.speculative and self.speculative.enabled and self.speculative.method in ("mtp", "eagle3", "dflash", "dspark"):
             if not self.enforce_eager or self.enable_prefix_cache:
-                raise ValueError("MTP currently requires enforce_eager=True and enable_prefix_cache=False")
+                raise ValueError("Feature-based draft backends currently require enforce_eager=True and enable_prefix_cache=False")
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8

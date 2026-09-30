@@ -33,8 +33,9 @@ full-attention decoder 和 final norm；使用独立 draft KV。
 新一轮根据新确认 target feature 重算对应区间，覆盖此前的 draft hidden 条件。
 无效 draft KV 尾部不进入后续注意力；结束或抢占时释放缓存所有权。
 
-当前 proposer 按请求、按候选串行生成 greedy 草稿，其 q 为点质量。
-随机 target 可使用它，但尚未实现概率 MTP proposer。
+当前 proposer 按请求、按候选串行生成草稿。`mtp_draft_sampling="greedy"` 为默认模式，q 为点质量；`"random"` 按请求 temperature 对 draft logits 做 FP32 softmax，并使用独立 `draft` 随机域采样，返回实际条件分布 q。temperature=0 的请求在 random 模式下仍生成 greedy 候选及 one-hot q，支持同批混合 greedy/random target。
+
+DraftContext 携带请求 temperature/seed；随机键由 seed、逻辑 token 位置与 domain 决定，相同已提交历史的重试和请求重排不会改变草稿随机流。未指定 seed 时使用进程初始 seed 与请求 ID；这是当前进程内复现规则。实际 q 为 `[候选总数, vocab_size]` FP32 张量，额外空间为候选数 × 词表大小 × 4 字节。random 草稿要求显式 `verification_mode="packed"`，与 n-gram 或 anchor-only 模式组合时配置报错。
 
 ## 配置与限制
 
@@ -64,7 +65,19 @@ finally:
 
 MTP 限于单 GPU、单个预测层、共享 embedding/head、eager、关闭 prefix cache，
 不满足配置明确报错。批量 proposer、投机图执行、MTP prefix 协作尚未实现。
-EAGLE-3/P-EAGLE、DFlash/DFlash2/DSpark 尚未实现，不会静默退回 n-gram。
+EAGLE-3 的初始线性适配见 [实现说明](eagle3_implementation.md)；P-EAGLE、DFlash/DFlash2/DSpark 尚未实现，不会静默退回 n-gram。
+
+## 概率 MTP 使用示例
+
+```python
+speculative = SpeculativeConfig(
+    enabled=True, method="mtp", max_draft_tokens=2,
+    verification_mode="packed", mtp_draft_sampling="random",
+)
+params = SamplingParams(temperature=0.8, seed=42, max_tokens=64)
+```
+
+引擎仍需 `enforce_eager=True`、`enable_prefix_cache=False`。随机模式不要求与普通 target 同 seed 逐 token 一致，也不据此宣称通用质量无损。
 
 ## 验收与测量
 

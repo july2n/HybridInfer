@@ -28,6 +28,10 @@ class Sequence:
         self.block_table = []
         self.restore_snapshot_id = None
         self.save_snapshot_id = None
+        # Produced after the previous sample; consumed by the next schedule.
+        self.spec_token_ids = ()
+        self.spec_draft_probabilities = None
+        self.spec_base_length = -1
         self.temperature = sampling_params.temperature
         self.seed = sampling_params.seed
         self.max_tokens = sampling_params.max_tokens

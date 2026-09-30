@@ -68,14 +68,7 @@ class LLMEngine:
         )
         self.config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(self.config)
-        self.scheduler.draft_proposer = self.model_runner.draft_proposer
-        if self.config.speculative and self.config.speculative.enabled:
-            per_token = sum(layer.conv_states[0].numel()*layer.conv_states.element_size()
-                            + layer.recurrent_states[0].numel()*layer.recurrent_states.element_size()
-                            for layer in self.model_runner.gdn_layers)
-            if per_token:
-                self.scheduler.max_speculative_tokens = min(self.config.max_num_batched_tokens,
-                    self.config.speculative.state_snapshot_budget_mb*1024**2//per_token)
+        self.scheduler.configure_draft(self.model_runner)
         # MRV2 async batch queue: up to max_concurrent_batches batches in
         # flight, CPU runs ahead of GPU by N-1 steps (core.py:622-736).
         self.max_concurrent_batches = 2
@@ -156,7 +149,7 @@ class LLMEngine:
         more decode; new prefill work is still allowed to dispatch so
         late arrivals keep making progress.
         """
-        # All speculative requests, including B=1, use one transaction path.
+        # A verification trial owns private GDN slots until its result is consumed.
         if not self.batch_queue:
             batch = self.scheduler.begin_speculative_batch()
             if batch is not None:

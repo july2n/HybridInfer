@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 import torch
 
-from .interfaces import VerificationResult
+from hybridinfer.spec_decode.interfaces import VerificationResult
 
 # Match the CPU reference's precedence: EOS, output limit, context limit.
 FINISH_REASONS = (None, 'eos', 'max_tokens', 'context')

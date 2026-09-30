@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import torch
 from validate_vllm_spec_alignment import load_definitions, load_reference, PINNED_COMMIT
-from hybridinfer.spec_decode.rejection import rejection_decisions
+from hybridinfer.sampling.rejection_sampler import rejection_decisions
 import triton
 import triton.language as tl
 

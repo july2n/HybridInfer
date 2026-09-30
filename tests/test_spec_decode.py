@@ -2,7 +2,7 @@ import unittest
 
 from hybridinfer.spec_decode.config import SpeculativeConfig
 from hybridinfer.spec_decode.interfaces import DraftContext, DraftProposal, VerificationPlan
-from hybridinfer.spec_decode.verifier import accept_greedy
+from hybridinfer.sampling.greedy_reference import accept_greedy
 
 
 class ContractTests(unittest.TestCase):
